@@ -18,6 +18,35 @@ import {
 } from './auth.js';
 import { generateLesson, generateQuiz, generateRoadmap } from './ai.js';
 import { billingStatusCode, createCreditTopUp, getCreditSummary, grantNewUserCredits, handleMidtransNotification, syncCreditTopUp } from './credits.js';
+import { isSupabaseStorage } from './supabase.js';
+import { remoteGetUserById, remoteRevokeSession, verifySupabaseAuthCode } from './supabase-auth.js';
+import {
+  remoteActivity,
+  remoteAcquireLessonLock,
+  remoteAddEvent,
+  remoteCompleteLesson,
+  remoteCompleteQuiz,
+  remoteCourseContext,
+  remoteCreateCourse,
+  remoteDeleteCourse,
+  remoteGetCourseMemory,
+  remoteGetQuiz,
+  remoteInsertQuiz,
+  remoteLessonRow,
+  remoteListCourses,
+  remoteReleaseLessonLock,
+  remoteSaveLessonMaterial,
+  remoteSerializeCourse,
+  remoteUpdateCourse,
+} from './supabase-store.js';
+import {
+  remoteBillingStatusCode,
+  remoteCreateCreditTopUp,
+  remoteGetCreditSummary,
+  remoteGrantNewUserCredits,
+  remoteHandleMidtransNotification,
+  remoteSyncCreditTopUp,
+} from './supabase-credits.js';
 import {
   CourseSchema,
   CoursePatchSchema,
@@ -152,6 +181,11 @@ function respondWithServiceError(res: Response, error: unknown, fallback: string
   const billing = billingStatusCode(error);
   if (billing) {
     res.status(billing.status).json(billing.body);
+    return;
+  }
+  const remoteBilling = remoteBillingStatusCode(error);
+  if (remoteBilling) {
+    res.status(remoteBilling.status).json(remoteBilling.body);
     return;
   }
   res.status(502).json({ error: error instanceof Error ? error.message : fallback });
@@ -301,8 +335,14 @@ function courseContext(courseId: string, scope: 'lesson' | 'chapter' | 'course',
   };
 }
 
-app.get('/healthz', (_req, res) => {
+app.get('/healthz', async (_req, res) => {
   try {
+    if (isSupabaseStorage()) {
+      const { supabaseHealth } = await import('./supabase-store.js');
+      await supabaseHealth();
+      res.json({ ok: true, service: 'synau', database: 'supabase' });
+      return;
+    }
     db.prepare('SELECT 1 AS ok').get();
     res.json({ ok: true, service: 'synau', database: 'ready' });
   } catch {
@@ -320,26 +360,30 @@ app.post('/api/auth/request-code', async (req, res) => {
   }
 });
 
-app.post('/api/auth/verify-code', (req, res) => {
+app.post('/api/auth/verify-code', async (req, res) => {
   const body = parseBody(AuthCodeVerifySchema, req, res);
   if (!body) return;
   try {
-    const result = verifyAuthCode(body);
-    if (result.created) grantNewUserCredits(result.user.id);
+    const result = isSupabaseStorage() ? await verifySupabaseAuthCode(body) : verifyAuthCode(body);
+    if (result.created) {
+      if (isSupabaseStorage()) await remoteGrantNewUserCredits(result.user.id);
+      else grantNewUserCredits(result.user.id);
+    }
     res.json({ token: result.token, user: UserSchema.parse(publicUser(result.user)) });
   } catch (error) {
     respondWithAuthError(res, error);
   }
 });
 
-app.post('/api/auth/logout', requireAuth, (req, res) => {
+app.post('/api/auth/logout', requireAuth, async (req, res) => {
   const token = (req.header('authorization') ?? '').slice(7);
-  revokeSession(token);
+  if (isSupabaseStorage()) await remoteRevokeSession(token);
+  else revokeSession(token);
   res.status(204).end();
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  const user = getUserById(userIdOf(req));
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  const user = isSupabaseStorage() ? await remoteGetUserById(userIdOf(req)) : getUserById(userIdOf(req));
   if (!user) {
     res.status(401).json({ error: 'Account not found.' });
     return;
@@ -347,7 +391,11 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ user: UserSchema.parse(publicUser(user)) });
 });
 
-app.get('/api/courses', requireAuth, (req, res) => {
+app.get('/api/courses', requireAuth, async (req, res) => {
+  if (isSupabaseStorage()) {
+    res.json({ courses: await remoteListCourses(userIdOf(req)) });
+    return;
+  }
   const rows = db.prepare('SELECT id FROM courses WHERE user_id = ? ORDER BY updated_at DESC').all(userIdOf(req)) as Array<{ id: string }>;
   res.json({ courses: rows.map((row) => serializeCourse(userIdOf(req), row.id)).filter(Boolean) });
 });
@@ -363,10 +411,15 @@ app.post('/api/generate/roadmap', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/courses', requireAuth, (req, res) => {
+app.post('/api/courses', requireAuth, async (req, res) => {
   const body = parseBody(RoadmapSchema, req, res);
   if (!body) return;
   const userId = userIdOf(req);
+  if (isSupabaseStorage()) {
+    const course = await remoteCreateCourse(userId, body);
+    res.status(201).json({ course });
+    return;
+  }
   const courseId = newId();
   const createdAt = nowIso();
   const insert = db.transaction((roadmap: Roadmap) => {
@@ -389,8 +442,10 @@ app.post('/api/courses', requireAuth, (req, res) => {
   res.status(201).json({ course: serializeCourse(userId, courseId) });
 });
 
-app.get('/api/courses/:courseId', requireAuth, (req, res) => {
-  const course = serializeCourse(userIdOf(req), routeParam(req, 'courseId'));
+app.get('/api/courses/:courseId', requireAuth, async (req, res) => {
+  const course = isSupabaseStorage()
+    ? await remoteSerializeCourse(userIdOf(req), routeParam(req, 'courseId'))
+    : serializeCourse(userIdOf(req), routeParam(req, 'courseId'));
   if (!course) {
     res.status(404).json({ error: 'Course not found.' });
     return;
@@ -398,15 +453,24 @@ app.get('/api/courses/:courseId', requireAuth, (req, res) => {
   res.json({ course });
 });
 
-app.patch('/api/courses/:courseId', requireAuth, (req, res) => {
+app.patch('/api/courses/:courseId', requireAuth, async (req, res) => {
   const courseId = routeParam(req, 'courseId');
-  const course = courseRow(userIdOf(req), courseId);
+  const course = isSupabaseStorage() ? undefined : courseRow(userIdOf(req), courseId);
   const body = parseBody(CoursePatchSchema, req, res);
+  if (!body) return;
+  if (isSupabaseStorage()) {
+    const updated = await remoteUpdateCourse(userIdOf(req), courseId, body);
+    if (!updated) {
+      res.status(404).json({ error: 'Course not found.' });
+      return;
+    }
+    res.json({ course: updated });
+    return;
+  }
   if (!course) {
     res.status(404).json({ error: 'Course not found.' });
     return;
   }
-  if (!body) return;
   const updatedAt = nowIso();
   const nextTitle = body.title ?? course.title;
   const nextStatus = body.status ?? course.status;
@@ -421,9 +485,23 @@ app.patch('/api/courses/:courseId', requireAuth, (req, res) => {
   res.json({ course: serializeCourse(userIdOf(req), courseId) });
 });
 
-app.delete('/api/courses/:courseId', requireAuth, (req, res) => {
+app.delete('/api/courses/:courseId', requireAuth, async (req, res) => {
   const userId = userIdOf(req);
   const courseId = routeParam(req, 'courseId');
+  if (isSupabaseStorage()) {
+    const course = await remoteSerializeCourse(userId, courseId);
+    if (!course) {
+      res.status(404).json({ error: 'Course not found.' });
+      return;
+    }
+    const result = await remoteDeleteCourse(userId, courseId);
+    if (result.locked) {
+      res.status(409).json({ code: 'course_generation_in_progress', error: 'This learning path is generating a lesson. Wait for it to finish before deleting the course.' });
+      return;
+    }
+    res.status(result.deleted ? 204 : 404).end();
+    return;
+  }
   const course = courseRow(userId, courseId);
   if (!course) {
     res.status(404).json({ error: 'Course not found.' });
@@ -447,6 +525,82 @@ app.post('/api/courses/:courseId/lessons/:lessonId/open', requireAuth, async (re
   const userId = userIdOf(req);
   const courseId = routeParam(req, 'courseId');
   const lessonId = routeParam(req, 'lessonId');
+  if (isSupabaseStorage()) {
+    const remoteLesson = await remoteLessonRow(userId, courseId, lessonId);
+    if (!remoteLesson) {
+      res.status(404).json({ error: 'Lesson not found.' });
+      return;
+    }
+    if (remoteLesson.course.status === 'archived') {
+      res.status(409).json({ error: 'Archived courses are read-only. Reopen the course to generate material.' });
+      return;
+    }
+    let generated = false;
+    if (!remoteLesson.row.material_json) {
+      const activeUserFlight = userLessonGenerationFlights.get(userId);
+      if (activeUserFlight && (activeUserFlight.courseId !== courseId || activeUserFlight.lessonId !== lessonId)) {
+        res.status(409).json({
+          code: 'lesson_generation_in_progress',
+          error: `Another lesson is currently being generated: “${activeUserFlight.lessonTitle}”. Please wait for it to finish before opening another subchapter.`,
+          activeLessonId: activeUserFlight.lessonId,
+          activeCourseId: activeUserFlight.courseId,
+        });
+        return;
+      }
+      try {
+        const flightKey = `${courseId}:${lessonId}`;
+        let flight = lessonGenerationFlights.get(flightKey);
+        if (!flight && activeUserFlight && activeUserFlight.courseId === courseId && activeUserFlight.lessonId === lessonId) flight = activeUserFlight.promise;
+        if (!flight) {
+          const lockResult = await remoteAcquireLessonLock(userId, courseId, lessonId, remoteLesson.row.title, new Date(Date.now() - lessonGenerationLockTtlMs).toISOString());
+          if (!lockResult.acquired) {
+            const lock = lockResult.lock;
+            const sameLesson = lock?.course_id === courseId && lock.lesson_id === lessonId;
+            res.status(409).json({
+              code: 'lesson_generation_in_progress',
+              error: sameLesson ? 'This lesson is already being generated. Please wait for it to finish before trying again.' : `Another lesson is currently being generated: “${lock?.lesson_title ?? 'another subchapter'}”. Please wait for it to finish before opening another lesson.`,
+              activeLessonId: lock?.lesson_id ?? lessonId,
+              activeCourseId: lock?.course_id ?? courseId,
+            });
+            return;
+          }
+          generated = true;
+          const generation = Promise.resolve().then(async () => generateLesson({
+            courseId,
+            lessonId,
+            topic: remoteLesson.course.topic,
+            courseTitle: remoteLesson.course.title,
+            sectionTitle: remoteLesson.sectionTitle,
+            lessonTitle: remoteLesson.row.title,
+            lessonSummary: remoteLesson.row.summary,
+            courseMemory: await remoteGetCourseMemory(courseId),
+          }, userId)).then(async (generatedMaterial) => {
+            const boundMaterial = LessonMaterialSchema.parse({ ...generatedMaterial, lessonId }) as LessonMaterial;
+            await remoteSaveLessonMaterial(lessonId, boundMaterial);
+            return boundMaterial;
+          }).finally(async () => {
+            await remoteReleaseLessonLock(userId, courseId, lessonId);
+            if (lessonGenerationFlights.get(flightKey) === generation) lessonGenerationFlights.delete(flightKey);
+            if (userLessonGenerationFlights.get(userId)?.promise === generation) userLessonGenerationFlights.delete(userId);
+          });
+          flight = generation;
+          lessonGenerationFlights.set(flightKey, generation);
+          userLessonGenerationFlights.set(userId, { courseId, lessonId, lessonTitle: remoteLesson.row.title, promise: generation });
+        }
+        await remoteAddEvent(userId, courseId, 'lesson_opened', lessonId);
+        await flight;
+      } catch (error) {
+        const billing = billingStatusCode(error) ?? remoteBillingStatusCode(error);
+        if (billing) res.status(billing.status).json(billing.body);
+        else res.status(502).json({ error: error instanceof Error ? error.message : 'Lesson generation failed.' });
+        return;
+      }
+    } else {
+      await remoteAddEvent(userId, courseId, 'lesson_opened', lessonId);
+    }
+    res.json({ course: await remoteSerializeCourse(userId, courseId), generated });
+    return;
+  }
   const course = courseRow(userId, courseId);
   const row = db.prepare(`
     SELECT l.*, s.title AS section_title FROM lessons l JOIN course_sections s ON s.id = l.section_id
@@ -539,10 +693,24 @@ app.post('/api/courses/:courseId/lessons/:lessonId/open', requireAuth, async (re
   res.json({ course: serializeCourse(userId, courseId), generated });
 });
 
-app.post('/api/courses/:courseId/lessons/:lessonId/complete', requireAuth, (req, res) => {
+app.post('/api/courses/:courseId/lessons/:lessonId/complete', requireAuth, async (req, res) => {
   const userId = userIdOf(req);
   const courseId = routeParam(req, 'courseId');
   const lessonId = routeParam(req, 'lessonId');
+  if (isSupabaseStorage()) {
+    const course = await remoteSerializeCourse(userId, courseId);
+    if (course?.status === 'archived') {
+      res.status(409).json({ error: 'Archived courses are read-only.' });
+      return;
+    }
+    const completed = await remoteCompleteLesson(userId, courseId, lessonId);
+    if (!course || !completed) {
+      res.status(404).json({ error: 'Lesson not found.' });
+      return;
+    }
+    res.json({ course: completed });
+    return;
+  }
   const course = courseRow(userId, courseId);
   const lesson = db.prepare(`SELECT l.id FROM lessons l JOIN course_sections s ON s.id = l.section_id
     WHERE l.id = ? AND s.course_id = ?`).get(lessonId, courseId) as { id: string } | undefined;
@@ -570,12 +738,16 @@ app.post('/api/quizzes/generate', requireAuth, async (req, res) => {
   const body = parseBody(QuizRequestSchema, req, res);
   if (!body) return;
   const userId = userIdOf(req);
-  const course = courseRow(userId, body.courseId);
+  const course = isSupabaseStorage()
+    ? await remoteSerializeCourse(userId, body.courseId)
+    : courseRow(userId, body.courseId);
   if (!course) {
     res.status(404).json({ error: 'Quiz scope not found.' });
     return;
   }
-  const context = courseContext(body.courseId, body.scope, body.scopeId);
+  const context = isSupabaseStorage()
+    ? await remoteCourseContext(body.courseId, body.scope, body.scopeId)
+    : courseContext(body.courseId, body.scope, body.scopeId);
   if (!context) {
     res.status(404).json({ error: 'Quiz scope not found.' });
     return;
@@ -591,23 +763,61 @@ app.post('/api/quizzes/generate', requireAuth, async (req, res) => {
       topic: course.topic,
       scopeTitle: context.title,
       materialContext: context.context,
-      courseMemory: getCourseMemory(body.courseId),
+      courseMemory: isSupabaseStorage() ? await remoteGetCourseMemory(body.courseId) : getCourseMemory(body.courseId),
     }, userId);
     const attemptId = newId();
     const storedQuiz = QuizSchema.parse({ ...quiz, id: attemptId, scope: body.scope, scopeId: body.scopeId });
-    db.prepare(`INSERT INTO quiz_attempts (id, user_id, course_id, scope, scope_id, quiz_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(attemptId, userId, body.courseId, body.scope, body.scopeId, json(storedQuiz), nowIso());
-    addEvent(userId, body.courseId, 'quiz_started', body.scope === 'lesson' ? body.scopeId : undefined, { scope: body.scope });
+    if (isSupabaseStorage()) {
+      await remoteInsertQuiz(userId, body.courseId, storedQuiz);
+      await remoteAddEvent(userId, body.courseId, 'quiz_started', body.scope === 'lesson' ? body.scopeId : undefined, { scope: body.scope });
+    } else {
+      db.prepare(`INSERT INTO quiz_attempts (id, user_id, course_id, scope, scope_id, quiz_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(attemptId, userId, body.courseId, body.scope, body.scopeId, json(storedQuiz), nowIso());
+      addEvent(userId, body.courseId, 'quiz_started', body.scope === 'lesson' ? body.scopeId : undefined, { scope: body.scope });
+    }
     res.status(201).json({ quiz: QuizPublicSchema.parse(storedQuiz) });
   } catch (error) {
     respondWithServiceError(res, error, 'Quiz generation failed.');
   }
 });
 
-app.post('/api/quizzes/:quizId/submit', requireAuth, (req, res) => {
+app.post('/api/quizzes/:quizId/submit', requireAuth, async (req, res) => {
   const body = parseBody(QuizSubmissionSchema, req, res);
   if (!body) return;
   const quizId = routeParam(req, 'quizId');
+  if (isSupabaseStorage()) {
+    const row = await remoteGetQuiz(userIdOf(req), quizId);
+    if (!row) {
+      res.status(404).json({ error: 'Quiz attempt not found.' });
+      return;
+    }
+    if (row.score !== null || row.completed_at) {
+      res.status(409).json({ error: 'This quiz attempt is already complete. Generate another attempt to retry.' });
+      return;
+    }
+    const quiz = QuizSchema.parse(row.quiz_json);
+    const checkedBody = createQuizSubmissionSchema(quiz).safeParse(body);
+    if (!checkedBody.success) {
+      res.status(400).json({ error: 'Invalid request.', issues: checkedBody.error.issues });
+      return;
+    }
+    const results = quiz.questions.map((question) => ({
+      questionId: question.id,
+      correct: checkedBody.data.answers[question.id] === question.answerIndex,
+      answerIndex: question.answerIndex,
+      explanation: question.explanation,
+    }));
+    const score = Math.round((results.filter((result) => result.correct).length / quiz.questions.length) * 100);
+    const completedAt = nowIso();
+    const completed = await remoteCompleteQuiz(userIdOf(req), quizId, score, completedAt);
+    if (!completed) {
+      res.status(409).json({ error: 'This quiz attempt is already complete. Generate another attempt to retry.' });
+      return;
+    }
+    await remoteAddEvent(userIdOf(req), completed.course_id, 'quiz_completed', completed.scope === 'lesson' ? completed.scope_id : undefined, { scope: completed.scope, score });
+    res.json({ score, results, quiz: QuizPublicSchema.parse(quiz) });
+    return;
+  }
   const row = db.prepare('SELECT * FROM quiz_attempts WHERE id = ? AND user_id = ?').get(quizId, userIdOf(req)) as {
     id: string; course_id: string; scope: 'lesson' | 'chapter' | 'course'; scope_id: string; quiz_json: string; score: number | null; completed_at: string | null;
   } | undefined;
@@ -648,8 +858,16 @@ app.post('/api/quizzes/:quizId/submit', requireAuth, (req, res) => {
   res.json({ score, results, quiz: QuizPublicSchema.parse(quiz) });
 });
 
-app.get('/api/courses/:courseId/activity', requireAuth, (req, res) => {
+app.get('/api/courses/:courseId/activity', requireAuth, async (req, res) => {
   const courseId = routeParam(req, 'courseId');
+  if (isSupabaseStorage()) {
+    if (!await remoteSerializeCourse(userIdOf(req), courseId)) {
+      res.status(404).json({ error: 'Course not found.' });
+      return;
+    }
+    res.json({ events: await remoteActivity(userIdOf(req), courseId) });
+    return;
+  }
   if (!courseRow(userIdOf(req), courseId)) {
     res.status(404).json({ error: 'Course not found.' });
     return;
@@ -659,7 +877,11 @@ app.get('/api/courses/:courseId/activity', requireAuth, (req, res) => {
   res.json({ events: events.map((event) => ({ type: event.event_type, lessonId: event.lesson_id, data: event.data_json ? parseJson(event.data_json) : null, at: event.created_at })) });
 });
 
-app.get('/api/credits', requireAuth, (req, res) => {
+app.get('/api/credits', requireAuth, async (req, res) => {
+  if (isSupabaseStorage()) {
+    res.json({ credits: await remoteGetCreditSummary(userIdOf(req)) });
+    return;
+  }
   res.json({ credits: getCreditSummary(userIdOf(req)) });
 });
 
@@ -667,7 +889,9 @@ app.post('/api/credits/topups', requireAuth, async (req, res) => {
   const body = parseBody(CreateTopUpInputSchema, req, res);
   if (!body) return;
   try {
-    const topUp = await createCreditTopUp(userIdOf(req), body.productId);
+    const topUp = isSupabaseStorage()
+      ? await remoteCreateCreditTopUp(userIdOf(req), body.productId)
+      : await createCreditTopUp(userIdOf(req), body.productId);
     res.status(201).json({ topUp });
   } catch (error) {
     respondWithServiceError(res, error, 'Could not create the credit top-up.');
@@ -676,19 +900,25 @@ app.post('/api/credits/topups', requireAuth, async (req, res) => {
 
 app.get('/api/credits/topups/:topUpId/status', requireAuth, async (req, res) => {
   try {
-    const status = await syncCreditTopUp(userIdOf(req), routeParam(req, 'topUpId'));
-    res.json({ ...status, credits: getCreditSummary(userIdOf(req)) });
+    const status = isSupabaseStorage()
+      ? await remoteSyncCreditTopUp(userIdOf(req), routeParam(req, 'topUpId'))
+      : await syncCreditTopUp(userIdOf(req), routeParam(req, 'topUpId'));
+    const credits = isSupabaseStorage() ? await remoteGetCreditSummary(userIdOf(req)) : getCreditSummary(userIdOf(req));
+    res.json({ ...status, credits });
   } catch (error) {
     respondWithServiceError(res, error, 'Could not refresh the credit top-up status.');
   }
 });
 
-app.post('/api/midtrans/notification', (req, res) => {
+app.post('/api/midtrans/notification', async (req, res) => {
   try {
-    res.json({ ok: true, ...handleMidtransNotification(req.body) });
+    const result = isSupabaseStorage() ? await remoteHandleMidtransNotification(req.body) : handleMidtransNotification(req.body);
+    res.json({ ok: true, ...result });
   } catch (error) {
     const billing = billingStatusCode(error);
+    const remoteBilling = remoteBillingStatusCode(error);
     if (billing) res.status(billing.status).json(billing.body);
+    else if (remoteBilling) res.status(remoteBilling.status).json(remoteBilling.body);
     else res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid Midtrans notification.' });
   }
 });

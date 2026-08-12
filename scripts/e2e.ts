@@ -7,7 +7,10 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 const evidence: string[] = [];
 
 try {
-  await page.goto(baseUrl, { waitUntil: 'networkidle' });
+  // Vite keeps its HMR client connection open in development, so networkidle
+  // is not a stable readiness signal. The assertions below provide the real
+  // readiness gates for the learner workflow.
+  await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
   await page.getByRole('tab', { name: 'Sign up' }).click();
   await expect(page.getByLabel('First Name')).toBeVisible();
   await expect(page.getByLabel('Last Name')).toBeVisible();
@@ -112,7 +115,7 @@ try {
   await expect(page.getByText(/score/i)).toBeVisible();
   evidence.push('quiz-repeatable');
 
-  await page.goto(baseUrl, { waitUntil: 'networkidle' });
+  await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
   const managedCard = page.locator('.course-card').first();
   await expect(managedCard).toBeVisible();
   const renamedCourseTitle = `${createdCourseTitle} — Managed`;

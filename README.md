@@ -6,7 +6,6 @@ Synau is a local-first agentic learning workspace. A learner enters a topic, rev
 
 ```bash
 npm install
-npm run seed
 npm run dev
 ```
 
@@ -33,9 +32,19 @@ The backend is configured with one fixed OpenAI-compatible provider: Sumopod's `
 - Progress: course completion, learning activity, and quality comparison evidence. The quality report remains available at `/quality` for internal review but is hidden from the learner navigation.
 - Credits: backend-managed credit balance, Midtrans top-up checkout, recent ledger activity, and a read-only summary of the fixed Sumopod provider. The balance is visible next to the profile menu; the browser never receives the Sumopod API key.
 
-The database is SQLite at `.data/synau.db` by default. It is intentionally local and easy to reset for repeatable QA. Quiz answer keys and explanations stay server-side until a submitted attempt is scored.
+Supabase is the active runtime when `SYNAU_STORAGE=supabase`. The backend uses the server-only `SUPABASE_SECRET_KEY` for the application tables and Supabase Auth's publishable key only for email OTP. RLS is enabled on every application table; browser roles have no table or RPC privileges, so learners can only reach the Express API boundary. The SQLite implementation remains an explicit local fallback at `.data/synau.db`; in Supabase mode the native SQLite module is not loaded at startup.
 
-Supabase project variables are included in `.env.example`. The publishable key is safe for browser/client configuration and is verified by `npm run qa:supabase` through the Auth settings endpoint. This local app has not migrated its SQLite schema yet; when the Supabase Data API for the project requires a server credential, provide `SUPABASE_SECRET_KEY` only in the backend environment and never in `NEXT_PUBLIC_*`, `VITE_*`, source control, or the browser bundle.
+For a fresh Supabase project, configure the variables in `.env` (never put the secret in `NEXT_PUBLIC_*`, `VITE_*`, source control, or the browser bundle), link the project, apply the schema, and migrate the existing local data:
+
+```bash
+supabase link --project-ref <project-ref> --skip-pooler
+supabase db push --linked                 # requires SUPABASE_DB_PASSWORD
+# If the database password is unavailable, use the linked Management API:
+supabase db query --linked --file supabase/migrations/20260812113729_synau_core_schema.sql
+npm run migrate:supabase                  # reads .data/synau.db and writes Supabase
+```
+
+`npm run migrate:supabase` preserves Synau IDs, creates or maps Supabase Auth users, migrates courses, sections, lazy lesson material, quiz attempts, progress events, credits, LLM usage, top-ups, sessions, and auth challenges, then verifies row counts. The checked-in migration is [supabase/migrations/20260812113729_synau_core_schema.sql](/Users/temamumtaza/Documents/synau2026/supabase/migrations/20260812113729_synau_core_schema.sql). Set `SYNAU_STORAGE=sqlite` and run `npm run seed` only when intentionally using the local fallback.
 
 ## Verification
 
@@ -61,7 +70,7 @@ These checks cover the fixed provider, every generator, credit reserve/settlemen
 
 ## Credits and Midtrans
 
-Credits are stored in SQLite on the backend with an append-only ledger and LLM usage records for input, cached input, output, total tokens, request count, and settled credit cost. Every new account receives 100 free credits exactly once. The demo account also has an additional 10,000-credit development top-up applied idempotently. Roadmap, lesson, and quiz generation each cost exactly 1 credit. Token usage is retained for diagnostics only and never changes the user charge. Failed, timed-out, invalid, and interrupted reservations are returned automatically, including stale reservation recovery after a process crash.
+Credits use a backend append-only ledger and LLM usage records for input, cached input, output, total tokens, request count, and settled credit cost. In Supabase mode holds, refunds, idempotent grants, and usage settlement run through locked server-side RPCs. Every new account receives 100 free credits exactly once. The demo account also has an additional 10,000-credit development top-up applied idempotently. Roadmap, lesson, and quiz generation each cost exactly 1 credit. Token usage is retained for diagnostics only and never changes the user charge. Failed, timed-out, invalid, and interrupted reservations are returned automatically, including stale reservation recovery after a process crash.
 
 Top-up packages use a base rate of 100 credits per Rp1,000 and add a larger bonus at higher values: Rp15,000 = 1,500 credits; Rp30,000 = 3,010 credits (10 bonus); Rp50,000 = 5,025 credits (25 bonus); Rp100,000 = 10,050 credits (50 bonus).
 

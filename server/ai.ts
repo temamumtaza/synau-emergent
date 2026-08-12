@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { beginLlmBilling, parseUsage, type LlmBilling } from './credits.js';
+import { isSupabaseStorage } from './supabase.js';
+import { beginRemoteLlmBilling, type RemoteLlmBilling } from './supabase-credits.js';
 import { generatorTools } from '../shared/generators.js';
 import {
   LessonGenerationInputSchema,
@@ -379,7 +381,7 @@ async function callTool<T>(args: {
   }
 
   const generationArgs = args;
-  let billing: LlmBilling | null = null;
+  let billing: LlmBilling | RemoteLlmBilling | null = null;
   let completed = false;
   const requestBody: Record<string, unknown> = {
     model: args.settings.model,
@@ -402,7 +404,9 @@ async function callTool<T>(args: {
     }],
   };
   try {
-    billing = beginLlmBilling(args.userId, args.key, args.settings.providerId, args.settings.model);
+    billing = isSupabaseStorage()
+      ? await beginRemoteLlmBilling(args.userId, args.key, args.settings.providerId, args.settings.model)
+      : beginLlmBilling(args.userId, args.key, args.settings.providerId, args.settings.model);
     const onUsage = (usage: ReturnType<typeof parseUsage>) => billing?.addUsage(usage);
     const requestContext = { ...generationArgs, onUsage };
     let repairRequestBody = requestBody;
@@ -444,7 +448,7 @@ async function callTool<T>(args: {
     }
     throw new Error(`Model provider returned invalid ${args.key} data.`);
   } finally {
-    billing?.finish(completed ? 'success' : 'failed');
+    if (billing) await billing.finish(completed ? 'success' : 'failed');
   }
 }
 

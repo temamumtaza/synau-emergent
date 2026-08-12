@@ -3,6 +3,8 @@ import type { Request, Response, NextFunction } from 'express';
 import type { AuthCodeRequest, AuthCodeVerify } from '../shared/schemas.js';
 import { db, newId, nowIso } from './db.js';
 import { sendAuthCodeEmail } from './email.js';
+import { isSupabaseStorage } from './supabase.js';
+import { remoteRevokeSession, remoteUserForToken, requestSupabaseAuthCode } from './supabase-auth.js';
 
 const DEMO_EMAIL = 'demo@synau.local';
 const DEMO_CODE = '020599';
@@ -114,6 +116,21 @@ export function getUserForToken(token: string) {
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.header('authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (isSupabaseStorage()) {
+    if (!token) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    void remoteUserForToken(token).then((user) => {
+      if (!user) {
+        res.status(401).json({ error: 'Authentication required.' });
+        return;
+      }
+      (req as AuthRequest).userId = user.id;
+      next();
+    }).catch(() => res.status(503).json({ error: 'Authentication service is temporarily unavailable.' }));
+    return;
+  }
   const user = token ? getUserForToken(token) : undefined;
   if (!user) {
     res.status(401).json({ error: 'Authentication required.' });
@@ -174,6 +191,7 @@ function challengeResponse(challengeId: string, email: string, expiresAt: string
 }
 
 export async function requestAuthCode(input: AuthCodeRequest) {
+  if (isSupabaseStorage()) return requestSupabaseAuthCode(input);
   const isSignUp = input.mode === 'sign_up';
   const identifier = isSignUp ? normalizeEmail(input.email) : input.identifier.trim().toLowerCase();
   const user = isSignUp ? undefined : getUserByLoginIdentifier(identifier);

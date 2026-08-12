@@ -11,14 +11,16 @@
     "seed": "tsx server/seed.ts",
     "e2e": "tsx scripts/e2e.ts",
     "qa:ui-shell": "tsx scripts/qa-ui-shell.ts",
-    "qa:auth": "SYNAU_DB_PATH=:memory: SYNAU_EMAIL_MODE=console tsx scripts/auth-flow-smoke.ts",
+    "qa:auth": "SYNAU_STORAGE=sqlite SYNAU_DB_PATH=:memory: SYNAU_EMAIL_MODE=console tsx scripts/auth-flow-smoke.ts",
     "qa:supabase": "tsx scripts/supabase-connection-smoke.ts",
+    "migrate:supabase": "SYNAU_STORAGE=sqlite tsx scripts/migrate-sqlite-to-supabase.ts",
     "qa:credits": "tsx scripts/credits-flow-smoke.ts",
     "qa:provider": "tsx scripts/qa-provider-e2e.ts",
     "qa:provider:browser": "tsx scripts/qa-provider-browser.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@supabase/supabase-js": "^2.112.3",
     "@theyahia/midtrans-mcp": "^1.0.2",
     "better-sqlite3": "^12.4.1",
     "cors": "^2.8.5",

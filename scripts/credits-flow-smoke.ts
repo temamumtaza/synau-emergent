@@ -9,14 +9,14 @@ page.on('pageerror', (error) => errors.push(`page: ${error.message}`));
 page.on('response', (response) => { if (response.status() >= 500) errors.push(`http ${response.status()}: ${response.url()}`); });
 
 try {
-  await page.goto(appUrl, { waitUntil: 'networkidle' });
+  await page.goto(appUrl, { waitUntil: 'domcontentloaded' });
   await page.getByLabel('Email or username').fill('demo@synau.local');
   await page.getByRole('button', { name: /send sign-in code/i }).click();
   await page.getByLabel('Verification code').fill('020599');
   await page.getByRole('button', { name: /verify and continue/i }).click();
   await expect(page.getByText('What do you want to understand next?')).toBeVisible();
-  await page.goto(`${appUrl}/credits`, { waitUntil: 'networkidle' });
-  await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible();
+  await page.goto(`${appUrl}/credits`, { waitUntil: 'domcontentloaded' });
+  await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('Your credits')).toBeVisible();
   await expect(page.getByText('Sumopod')).toBeVisible();
   await expect(page.getByText('deepseek-v4-flash')).toBeVisible();

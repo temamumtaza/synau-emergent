@@ -60,7 +60,7 @@ async function deleteFixtureCourses() {
 }
 
 try {
-  await page.goto(baseUrl, { waitUntil: 'networkidle' });
+  await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
   await page.getByLabel('Email or username').fill('demo@synau.local');
   await page.getByRole('button', { name: 'Send sign-in code' }).click();
   await expect(page.getByText('Demo account code:')).toBeVisible();
@@ -69,7 +69,7 @@ try {
   await expect(page.getByRole('heading', { name: 'What do you want to understand next?' })).toBeVisible();
 
   for (let index = 1; index <= 7; index += 1) await createCourse(index);
-  await page.reload({ waitUntil: 'networkidle' });
+  await page.reload({ waitUntil: 'domcontentloaded' });
 
   await expect(page.locator('nav[aria-label="Primary navigation"]')).toHaveCount(0);
   await expect(page.locator('.credit-chip')).toBeVisible();
@@ -84,13 +84,14 @@ try {
   await expect(page.getByRole('heading', { name: 'Profile & settings' })).toBeVisible();
 
   await page.getByRole('button', { name: /Credits & billing/ }).click();
-  await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible({ timeout: 15_000 });
 
-  await page.goto(`${baseUrl}/quality`, { waitUntil: 'networkidle' });
+  await page.goto(`${baseUrl}/quality`, { waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('heading', { name: /Measured against the learner experience/ })).toBeVisible();
 
-  await page.goto(`${baseUrl}/library`, { waitUntil: 'networkidle' });
+  await page.goto(`${baseUrl}/library`, { waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('heading', { name: 'All learning paths' })).toBeVisible();
+  await expect(page.locator('.library-page__count')).toBeVisible({ timeout: 30_000 });
   const fullLibraryCount = await page.locator('.library-page .course-card').count();
   if (fullLibraryCount < 7) throw new Error(`Full library only rendered ${fullLibraryCount} paths.`);
 
