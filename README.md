@@ -9,14 +9,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:8787](http://localhost:8787). The seeded login is:
-
-- Email: `demo@synau.local`
-- Verification code: `020599`
-
-Authentication is passwordless. Sign in with an email or username, request a six-digit code, and verify it. New accounts require First Name, Last Name, username, and email before the verification code is sent. The demo account is the only local exception and accepts `020599`.
-
-For real email delivery, configure `SYNAU_EMAIL_MODE=smtp`, `SYNAU_EMAIL_FROM`, and the `SYNAU_SMTP_*` variables in the backend environment. During local development, `SYNAU_EMAIL_MODE=console` prints the generated code to the server terminal; it is never the production default.
+Open [http://localhost:8787](http://localhost:8787). Supabase mode uses Google as the only authentication provider. On the first Google sign-in, Synau asks for First Name, Last Name, and username; returning users go straight to their learning space. The SQLite fallback still keeps the email-code harness for deterministic local QA.
 
 The backend is configured with one fixed OpenAI-compatible provider: Sumopod's `deepseek-v4-flash` endpoint. The provider base URL and API key are server environment settings; the browser never receives or edits the provider key. Set `SYNAU_DEMO_MODE=true` only for deterministic local harnesses. Every generator is forced through a named function tool, sends thinking disabled, records provider usage, and is validated with the matching Zod schema.
 
@@ -32,7 +25,7 @@ The backend is configured with one fixed OpenAI-compatible provider: Sumopod's `
 - Progress: course completion, learning activity, and quality comparison evidence. The quality report remains available at `/quality` for internal review but is hidden from the learner navigation.
 - Credits: backend-managed credit balance, Midtrans top-up checkout, recent ledger activity, and a read-only summary of the fixed Sumopod provider. The balance is visible next to the profile menu; the browser never receives the Sumopod API key.
 
-Supabase is the active runtime when `SYNAU_STORAGE=supabase`. The backend uses the server-only `SUPABASE_SECRET_KEY` for the application tables and Supabase Auth's publishable key only for email OTP. RLS is enabled on every application table; browser roles have no table or RPC privileges, so learners can only reach the Express API boundary. The SQLite implementation remains an explicit local fallback at `.data/synau.db`; in Supabase mode the native SQLite module is not loaded at startup.
+Supabase is the active runtime when `SYNAU_STORAGE=supabase`. The backend uses the server-only `SUPABASE_SECRET_KEY` for application tables and to validate Supabase Auth Google sessions; the browser receives only the publishable key and the OAuth session. RLS is enabled on every application table; browser roles have no table or RPC privileges, so learners can only reach the Express API boundary. The SQLite implementation remains an explicit local fallback at `.data/synau.db`; in Supabase mode the native SQLite module is not loaded at startup.
 
 For a fresh Supabase project, configure the variables in `.env` (never put the secret in `NEXT_PUBLIC_*`, `VITE_*`, source control, or the browser bundle), link the project, apply the schema, and migrate the existing local data:
 
@@ -46,17 +39,17 @@ npm run migrate:supabase                  # reads .data/synau.db and writes Supa
 
 `npm run migrate:supabase` preserves Synau IDs, creates or maps Supabase Auth users, migrates courses, sections, lazy lesson material, quiz attempts, progress events, credits, LLM usage, top-ups, sessions, and auth challenges, then verifies row counts. The checked-in migration is [supabase/migrations/20260812113729_synau_core_schema.sql](/Users/temamumtaza/Documents/synau2026/supabase/migrations/20260812113729_synau_core_schema.sql). Set `SYNAU_STORAGE=sqlite` and run `npm run seed` only when intentionally using the local fallback.
 
-### Supabase email-code delivery
+### Supabase Google authentication
 
-Synau uses Supabase Auth's six-digit email OTP in Supabase mode. The hosted project's default mailer is rate-limited and is not a production delivery service, so configure a real SMTP provider before testing with a normal learner address. The versioned Synau template is [supabase/templates/auth-otp.html](/Users/temamumtaza/Documents/synau2026/supabase/templates/auth-otp.html); it deliberately uses `{{ .Token }}` and does not include `{{ .ConfirmationURL }}`, so Supabase sends a code rather than a magic link.
+Create a Web OAuth client in Google Cloud. Add the app origins (`http://localhost:8787` and `http://127.0.0.1:8787` during development) as authorized JavaScript origins. Add the exact Supabase callback shown in Authentication → Providers → Google as an authorized redirect URI; for this hosted project it follows `https://<project-ref>.supabase.co/auth/v1/callback`. In Supabase Authentication → URL Configuration, add both local app URLs to the redirect allow list.
 
-For a repeatable hosted setup, add a Supabase Personal Access Token and SMTP values to your local `.env`, then run:
+For a repeatable hosted setup, add a Supabase Personal Access Token and the Google OAuth client values to your local `.env`, then run:
 
 ```bash
-npm run auth:configure
+npm run auth:configure-google
 ```
 
-The command patches the linked project's Auth SMTP and both confirmation/OTP templates through the Supabase Management API. `SUPABASE_SECRET_KEY` cannot perform this configuration; do not paste either token into source control or the browser bundle. The dashboard equivalent is Authentication → SMTP Settings and Authentication → Email Templates. After configuration, restart the local Synau server and request a fresh code. The demo account remains local to Synau and uses `020599` without sending email.
+The command enables Google and disables Supabase email auth through the Management API. `SUPABASE_SECRET_KEY` cannot perform this configuration; do not paste either token or Google secret into source control or the browser bundle. The dashboard equivalent is Authentication → Providers → Google and Authentication → URL Configuration. Supabase Auth still has abuse protection/rate limits on authentication endpoints, but Google-only login avoids the hosted email-send quota; repeated OAuth attempts can still receive HTTP 429 and should be handled with retry/backoff.
 
 ## Verification
 
@@ -71,14 +64,14 @@ The E2E runner uses the seeded account and a headless Chromium browser. It exerc
 
 The UI shell smoke adds temporary learning paths, verifies the six-card dashboard cap, opens the profile-first settings and credits routes, confirms that `/quality` is not in learner navigation while remaining directly accessible, and checks the full `/library` view. Temporary fixtures are deleted after the run.
 
-For a live fixed-provider run, use a configured backend environment and run the provider checks with the demo credentials:
+For a live fixed-provider run against the local SQLite harness, use the demo credentials:
 
 ```bash
 SYNAU_TEST_EMAIL='demo@synau.local' SYNAU_TEST_CODE='020599' npm run qa:provider
 SYNAU_TEST_EMAIL='demo@synau.local' SYNAU_TEST_CODE='020599' npm run qa:provider:browser
 ```
 
-These checks cover the fixed provider, every generator, credit reserve/settlement, lazy lesson opening, repeatable quizzes, progress, archive/reopen behavior, and authentication. Temporary QA courses are deleted by their explicit IDs after each run.
+These checks cover the fixed provider, every generator, credit reserve/settlement, lazy lesson opening, repeatable quizzes, progress, archive/reopen behavior, and the local email-code fallback. Supabase Google OAuth requires a real browser session and configured Google provider, so it is not synthetically claimed by these harnesses. Temporary QA courses are deleted by their explicit IDs after each run.
 
 ## Credits and Midtrans
 

@@ -13,7 +13,7 @@
     "qa:ui-shell": "tsx scripts/qa-ui-shell.ts",
     "qa:auth": "SYNAU_STORAGE=sqlite SYNAU_DB_PATH=:memory: SYNAU_EMAIL_MODE=console tsx scripts/auth-flow-smoke.ts",
     "qa:supabase": "tsx scripts/supabase-connection-smoke.ts",
-    "auth:configure": "tsx scripts/configure-supabase-auth.ts",
+    "auth:configure-google": "tsx scripts/configure-supabase-google.ts",
     "migrate:supabase": "SYNAU_STORAGE=sqlite tsx scripts/migrate-sqlite-to-supabase.ts",
     "qa:credits": "tsx scripts/credits-flow-smoke.ts",
     "qa:provider": "tsx scripts/qa-provider-e2e.ts",

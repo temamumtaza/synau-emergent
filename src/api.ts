@@ -3,6 +3,7 @@ import type {
   AuthResponse,
   Course,
   CreditSummary,
+  GoogleAuthResponse,
   TopUpResponse,
   ProductProgress,
   Quiz,
@@ -74,6 +75,17 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
 const jsonBody = (value: unknown) => JSON.stringify(value);
 
 export const api = {
+  authConfig() {
+    return request<{ provider: 'google' | 'email' }>('/api/auth/config', {}, false);
+  },
+
+  completeGoogleAuth(accessToken: string, profile?: { firstName: string; lastName: string; username: string }) {
+    return request<GoogleAuthResponse>('/api/auth/google/session', {
+      method: 'POST',
+      body: jsonBody({ accessToken, ...profile }),
+    }, false);
+  },
+
   requestSignInCode(identifier: string) {
     return request<AuthCodeResponse>('/api/auth/request-code', {
       method: 'POST',

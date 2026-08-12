@@ -1,31 +1,8 @@
-import crypto from 'node:crypto';
-import type { AuthCodeRequest, AuthCodeVerify } from '../shared/schemas.js';
+import type { GoogleAuthRequest } from '../shared/schemas.js';
 import { newId, nowIso } from './db.js';
-import { getSupabaseAdmin, getSupabaseAuthClient } from './supabase.js';
+import { getSupabaseAdmin } from './supabase.js';
 import type { UserRecord } from './auth.js';
 import { AuthFlowError, normalizeUsername } from './auth.js';
-
-const DEMO_EMAIL = 'demo@synau.local';
-const DEMO_CODE = '020599';
-const AUTH_CODE_TTL_MS = Math.max(60_000, Number(process.env.SYNAU_AUTH_CODE_TTL_MINUTES ?? 10) * 60_000);
-const AUTH_CODE_RESEND_COOLDOWN_MS = Math.max(5_000, Number(process.env.SYNAU_AUTH_CODE_RESEND_COOLDOWN_SECONDS ?? 45) * 1_000);
-const AUTH_CODE_MAX_ATTEMPTS = 5;
-const AUTH_CODE_SECRET = (process.env.SYNAU_AUTH_CODE_SECRET ?? 'synau-local-auth-code-secret-change-me').trim();
-
-type RemoteChallenge = {
-  id: string;
-  mode: 'sign_in' | 'sign_up';
-  identifier: string;
-  email: string;
-  first_name: string;
-  last_name: string;
-  username: string;
-  code_hash: string;
-  attempts: number;
-  expires_at: string;
-  consumed_at: string | null;
-  created_at: string;
-};
 
 type RemoteProfile = {
   id: string;
@@ -37,14 +14,17 @@ type RemoteProfile = {
   name: string;
 };
 
+type GoogleAuthUser = {
+  id: string;
+  email?: string | null;
+  user_metadata?: Record<string, unknown> | null;
+  app_metadata?: Record<string, unknown> | null;
+};
+
 async function read<T>(query: PromiseLike<{ data: T; error: { message: string } | null }>) {
   const result = await query;
   if (result.error) throw new Error(`Supabase auth query failed: ${result.error.message}`);
   return result.data;
-}
-
-function hash(challengeId: string, code: string) {
-  return crypto.createHmac('sha256', AUTH_CODE_SECRET).update(`${challengeId}:${code}`).digest('hex');
 }
 
 function normalizeEmail(email: string) {
@@ -53,61 +33,6 @@ function normalizeEmail(email: string) {
 
 function displayName(firstName: string, lastName: string) {
   return `${firstName.trim()} ${lastName.trim()}`.trim();
-}
-
-function maskEmail(email: string) {
-  if (!email || !email.includes('@')) return 'your email address';
-  const [local, domain] = email.split('@');
-  const visible = local.slice(0, Math.min(2, local.length));
-  return `${visible}${'*'.repeat(Math.max(2, local.length - visible.length))}@${domain}`;
-}
-
-type SupabaseEmailError = {
-  code?: string | null;
-  message?: string | null;
-  status?: number | null;
-};
-
-function authEmailError(error: SupabaseEmailError) {
-  const code = String(error.code ?? '').toLowerCase();
-  const message = String(error.message ?? '').toLowerCase();
-
-  // Keep provider details in server logs while returning a useful, safe next
-  // step to the learner. In particular, Supabase's default hosted mailer is
-  // intentionally limited and commonly reports either a rate limit or an
-  // authorization/configuration failure here.
-  console.warn(`[auth-email:supabase] delivery failed code=${code || 'unknown'} status=${error.status ?? 'unknown'} message=${error.message ?? 'unknown'}`);
-
-  if (code === 'over_email_send_rate_limit' || message.includes('rate limit')) {
-    return new AuthFlowError(
-      'Email delivery is temporarily rate-limited. Wait for the limit to reset before requesting another code.',
-      429,
-      'email_rate_limited',
-    );
-  }
-
-  if (code === 'email_address_invalid') {
-    return new AuthFlowError('Supabase rejected this email address. Check it and try again.', 400, 'email_address_invalid');
-  }
-
-  if (
-    code === 'email_address_not_authorized'
-    || message.includes('not authorized')
-    || message.includes('not allowed')
-    || message.includes('pre-authorized')
-  ) {
-    return new AuthFlowError(
-      'This project is not configured to deliver email to this address yet. Configure Custom SMTP in Supabase Auth, then try again.',
-      503,
-      'email_provider_not_configured',
-    );
-  }
-
-  return new AuthFlowError(
-    'We could not send the verification email. Configure Custom SMTP in Supabase Auth and try again.',
-    503,
-    'email_delivery_failed',
-  );
 }
 
 function profileUser(profile: RemoteProfile): UserRecord {
@@ -129,13 +54,17 @@ async function profileByUsername(username: string) {
   return read(getSupabaseAdmin().from('users').select('*').eq('username', normalizeUsername(username)).maybeSingle<RemoteProfile>());
 }
 
+async function profileByAuthId(authUserId: string) {
+  return read(getSupabaseAdmin().from('users').select('*').eq('auth_user_id', authUserId).maybeSingle<RemoteProfile>());
+}
+
 export async function remoteGetUserById(id: string) {
   const profile = await read(getSupabaseAdmin().from('users').select('*').eq('id', id).maybeSingle<RemoteProfile>());
   return profile ? profileUser(profile) : undefined;
 }
 
 export async function remoteGetUserByAuthId(authUserId: string) {
-  const profile = await read(getSupabaseAdmin().from('users').select('*').eq('auth_user_id', authUserId).maybeSingle<RemoteProfile>());
+  const profile = await profileByAuthId(authUserId);
   return profile ? profileUser(profile) : undefined;
 }
 
@@ -145,88 +74,99 @@ export async function remoteGetUserByLoginIdentifier(identifier: string) {
   return profile ? profileUser(profile) : undefined;
 }
 
-async function remoteGetChallenge(id: string) {
-  return read(getSupabaseAdmin().from('auth_challenges').select('*').eq('id', id).maybeSingle<RemoteChallenge>());
+function metadataString(user: GoogleAuthUser, ...keys: string[]) {
+  for (const key of keys) {
+    const value = user.user_metadata?.[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
 }
 
-function challengeResponse(challengeId: string, email: string, expiresAt: string, isDemo: boolean, message: string) {
+function usernameSuggestion(user: GoogleAuthUser, email: string) {
+  const source = metadataString(user, 'username', 'preferred_username', 'given_name') || email.split('@')[0] || 'learner';
+  let suggestion = source.toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 32);
+  suggestion = suggestion.replace(/[^a-z0-9]$/g, '');
+  if (suggestion.length < 3) suggestion = `${suggestion || 'synau'}learner`.slice(0, 32);
+  return suggestion;
+}
+
+function googleProfileSuggestion(user: GoogleAuthUser, email: string) {
+  const fullName = metadataString(user, 'full_name', 'name');
+  const nameParts = fullName.split(/\s+/).filter(Boolean);
+  const firstName = metadataString(user, 'given_name', 'first_name') || nameParts[0] || 'Learner';
+  const lastName = metadataString(user, 'family_name', 'last_name') || nameParts.slice(1).join(' ') || 'User';
   return {
-    challengeId,
-    maskedEmail: maskEmail(email),
-    expiresAt,
-    retryAfterSeconds: Math.ceil(AUTH_CODE_RESEND_COOLDOWN_MS / 1_000),
-    isDemo,
-    message,
+    email,
+    firstName: firstName.slice(0, 60),
+    lastName: lastName.slice(0, 60),
+    username: usernameSuggestion(user, email),
   };
 }
 
-export async function requestSupabaseAuthCode(input: AuthCodeRequest) {
-  const isSignUp = input.mode === 'sign_up';
-  const identifier = isSignUp ? normalizeEmail(input.email) : input.identifier.trim().toLowerCase();
-  const existingUser = isSignUp ? undefined : await remoteGetUserByLoginIdentifier(identifier);
-  if (isSignUp) {
-    if (await profileByEmail(input.email)) throw new AuthFlowError('An account with that email already exists. Sign in to continue.', 409, 'email_already_registered');
-    if (await profileByUsername(input.username)) throw new AuthFlowError('That username is already taken. Choose another one.', 409, 'username_already_registered');
-  }
-  const recent = await read(getSupabaseAdmin().from('auth_challenges').select('created_at').eq('mode', input.mode).eq('identifier', identifier).is('consumed_at', null).order('created_at', { ascending: false }).limit(1).maybeSingle<{ created_at: string }>()).catch(() => null);
-  if (recent && Date.now() - new Date(recent.created_at).getTime() < AUTH_CODE_RESEND_COOLDOWN_MS) {
-    const retryAfterSeconds = Math.ceil((AUTH_CODE_RESEND_COOLDOWN_MS - (Date.now() - new Date(recent.created_at).getTime())) / 1_000);
-    throw new AuthFlowError(`Please wait ${retryAfterSeconds} seconds before requesting another code.`, 429, 'auth_code_cooldown', retryAfterSeconds);
-  }
-
-  const email = isSignUp ? normalizeEmail(input.email) : existingUser?.email ?? (identifier.includes('@') ? identifier : '');
-  const isDemo = existingUser?.email === DEMO_EMAIL;
-  if (!existingUser && !isSignUp) {
-    // Keep the account-enumeration-safe behavior of the local flow.
-    return challengeResponse(newId(), email, new Date(Date.now() + AUTH_CODE_TTL_MS).toISOString(), false, 'If an account exists for that email or username, a verification code has been sent.');
-  }
-
-  const challengeId = newId();
-  const expiresAt = new Date(Date.now() + AUTH_CODE_TTL_MS).toISOString();
-  await read(getSupabaseAdmin().from('auth_challenges').update({ consumed_at: nowIso() }).eq('mode', input.mode).eq('identifier', identifier).is('consumed_at', null));
-  await read(getSupabaseAdmin().from('auth_challenges').insert({
-    id: challengeId,
-    mode: input.mode,
-    identifier,
-    email,
-    first_name: isSignUp ? input.firstName.trim() : existingUser?.first_name ?? '',
-    last_name: isSignUp ? input.lastName.trim() : existingUser?.last_name ?? '',
-    username: isSignUp ? normalizeUsername(input.username) : existingUser?.username ?? '',
-    code_hash: isDemo ? hash(challengeId, DEMO_CODE) : 'supabase-managed',
-    expires_at: expiresAt,
-    created_at: nowIso(),
-  }));
-
-  if (isDemo) {
-    return challengeResponse(challengeId, email, expiresAt, true, 'Demo account recognized. Enter the demo verification code to continue.');
-  }
-
-  const auth = getSupabaseAuthClient();
-  const { error } = await auth.auth.signInWithOtp({
-    email,
-    options: {
-      shouldCreateUser: isSignUp,
-      data: isSignUp ? {
-        first_name: input.firstName.trim(),
-        last_name: input.lastName.trim(),
-        username: normalizeUsername(input.username),
-      } : undefined,
-    },
-  });
-  if (error) {
-    await read(getSupabaseAdmin().from('auth_challenges').delete().eq('id', challengeId));
-    throw authEmailError(error);
-  }
-  return challengeResponse(challengeId, email, expiresAt, false, `We sent a verification code to ${maskEmail(email)}.`);
+function hasGoogleIdentity(user: GoogleAuthUser) {
+  const provider = user.app_metadata?.provider;
+  const providers = user.app_metadata?.providers;
+  return provider === 'google' || (Array.isArray(providers) && providers.includes('google'));
 }
 
-async function ensureProfile(authUser: { id: string; email?: string | null; user_metadata?: Record<string, unknown> | null }, challenge: RemoteChallenge) {
-  const existing = await remoteGetUserByAuthId(authUser.id);
-  if (existing) return { user: existing, created: false };
-  const firstName = challenge.first_name || String(authUser.user_metadata?.first_name ?? 'Learner');
-  const lastName = challenge.last_name || String(authUser.user_metadata?.last_name ?? 'User');
-  const username = challenge.username || normalizeUsername(String(authUser.user_metadata?.username ?? (authUser.email ?? '').split('@')[0]));
-  const email = normalizeEmail(authUser.email ?? challenge.email);
+async function verifiedGoogleUser(accessToken: string) {
+  const { data, error } = await getSupabaseAdmin().auth.getUser(accessToken);
+  if (error || !data.user) {
+    throw new AuthFlowError('Google sign-in could not be verified. Start again from the Google button.', 401, 'google_token_invalid');
+  }
+  const user = data.user as GoogleAuthUser;
+  if (!hasGoogleIdentity(user)) {
+    throw new AuthFlowError('This Synau environment accepts Google accounts only. Start again with Google.', 403, 'google_auth_only');
+  }
+  const email = normalizeEmail(user.email ?? '');
+  if (!email || !email.includes('@')) {
+    throw new AuthFlowError('Google did not provide a usable email address for this account.', 400, 'google_email_missing');
+  }
+  return { user, email };
+}
+
+async function linkExistingEmailProfile(user: GoogleAuthUser, email: string) {
+  const existing = await profileByEmail(email);
+  if (!existing) return undefined;
+  if (existing.auth_user_id && existing.auth_user_id !== user.id) {
+    throw new AuthFlowError('This email is already linked to another Synau identity.', 409, 'google_account_conflict');
+  }
+  if (!existing.auth_user_id) {
+    const linked = await read(getSupabaseAdmin().from('users').update({ auth_user_id: user.id }).eq('id', existing.id).is('auth_user_id', null).select('*').maybeSingle<RemoteProfile>());
+    if (!linked) throw new AuthFlowError('Synau could not link this Google account yet. Please try again.', 503, 'google_profile_link_failed');
+    return profileUser(linked);
+  }
+  return profileUser(existing);
+}
+
+export async function completeSupabaseGoogleAuth(input: GoogleAuthRequest) {
+  const { user: authUser, email } = await verifiedGoogleUser(input.accessToken);
+  const existingByAuthId = await profileByAuthId(authUser.id);
+  if (existingByAuthId) {
+    return { status: 'authenticated' as const, token: input.accessToken, user: profileUser(existingByAuthId), created: false };
+  }
+
+  // A migrated Synau account can be linked to Google by its verified email,
+  // without asking the learner to recreate their profile.
+  const linkedProfile = await linkExistingEmailProfile(authUser, email);
+  if (linkedProfile) {
+    return { status: 'authenticated' as const, token: input.accessToken, user: linkedProfile, created: false };
+  }
+
+  const suggestion = googleProfileSuggestion(authUser, email);
+  const hasAllProfileFields = Boolean(input.firstName && input.lastName && input.username);
+  if (!hasAllProfileFields) {
+    return { status: 'profile_required' as const, profile: suggestion };
+  }
+
+  const firstName = input.firstName!.trim();
+  const lastName = input.lastName!.trim();
+  const username = normalizeUsername(input.username!);
+  const usernameConflict = await profileByUsername(username);
+  if (usernameConflict) {
+    throw new AuthFlowError('That username is already taken. Choose another one.', 409, 'username_already_registered');
+  }
+
   const created = await read(getSupabaseAdmin().from('users').insert({
     id: newId(),
     auth_user_id: authUser.id,
@@ -237,44 +177,12 @@ async function ensureProfile(authUser: { id: string; email?: string | null; user
     name: displayName(firstName, lastName),
   }).select('*').single<RemoteProfile>());
   if (!created) throw new AuthFlowError('Could not create your Synau profile. Please try again.', 503, 'profile_creation_failed');
-  return { user: profileUser(created), created: true };
-}
-
-export async function verifySupabaseAuthCode(input: AuthCodeVerify) {
-  const challenge = await remoteGetChallenge(input.challengeId);
-  if (!challenge || challenge.consumed_at) throw new AuthFlowError('This verification code is no longer valid. Request a new code.', 400, 'auth_code_invalid');
-  if (new Date(challenge.expires_at).getTime() <= Date.now()) throw new AuthFlowError('This verification code has expired. Request a new code.', 400, 'auth_code_expired');
-  if (challenge.attempts >= AUTH_CODE_MAX_ATTEMPTS) throw new AuthFlowError('Too many incorrect attempts. Request a new code.', 429, 'auth_code_locked');
-  await read(getSupabaseAdmin().from('auth_challenges').update({ attempts: challenge.attempts + 1 }).eq('id', challenge.id));
-
-  if (challenge.email === DEMO_EMAIL) {
-    const expected = Buffer.from(challenge.code_hash, 'hex');
-    const received = Buffer.from(hash(challenge.id, input.code), 'hex');
-    if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
-      const remaining = Math.max(0, AUTH_CODE_MAX_ATTEMPTS - challenge.attempts - 1);
-      throw new AuthFlowError(remaining ? `That code is incorrect. ${remaining} attempts remaining.` : 'That code is incorrect. Request a new code.', remaining ? 400 : 429, remaining ? 'auth_code_incorrect' : 'auth_code_locked');
-    }
-    const user = await remoteGetUserByLoginIdentifier(challenge.identifier);
-    if (!user) throw new AuthFlowError('This verification code is no longer valid. Request a new code.', 400, 'auth_code_invalid');
-    const token = crypto.randomBytes(32).toString('hex');
-    await read(getSupabaseAdmin().from('sessions').insert({ token, user_id: user.id, expires_at: new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString(), created_at: nowIso() }));
-    await read(getSupabaseAdmin().from('auth_challenges').update({ consumed_at: nowIso() }).eq('id', challenge.id));
-    return { token, user, created: false };
-  }
-
-  const { data, error } = await getSupabaseAuthClient().auth.verifyOtp({ email: challenge.email, token: input.code, type: 'email' });
-  if (error || !data.user || !data.session?.access_token) {
-    const remaining = Math.max(0, AUTH_CODE_MAX_ATTEMPTS - challenge.attempts - 1);
-    throw new AuthFlowError(remaining ? `That code is incorrect. ${remaining} attempts remaining.` : 'That code is incorrect. Request a new code.', remaining ? 400 : 429, remaining ? 'auth_code_incorrect' : 'auth_code_locked');
-  }
-  const ensured = await ensureProfile(data.user, challenge);
-  await read(getSupabaseAdmin().from('auth_challenges').update({ consumed_at: nowIso() }).eq('id', challenge.id));
-  return { token: data.session.access_token, user: ensured.user, created: ensured.created };
+  return { status: 'authenticated' as const, token: input.accessToken, user: profileUser(created), created: true };
 }
 
 export async function remoteUserForToken(token: string) {
   const { data } = await getSupabaseAdmin().auth.getUser(token);
-  if (data.user) return remoteGetUserByAuthId(data.user.id);
+  if (data.user) return hasGoogleIdentity(data.user as GoogleAuthUser) ? remoteGetUserByAuthId(data.user.id) : undefined;
   const session = await read(getSupabaseAdmin().from('sessions').select('user_id').eq('token', token).gt('expires_at', nowIso()).maybeSingle<{ user_id: string }>()).catch(() => null);
   return session ? remoteGetUserById(session.user_id) : undefined;
 }

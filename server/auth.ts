@@ -4,7 +4,7 @@ import type { AuthCodeRequest, AuthCodeVerify } from '../shared/schemas.js';
 import { db, newId, nowIso } from './db.js';
 import { sendAuthCodeEmail } from './email.js';
 import { isSupabaseStorage } from './supabase.js';
-import { remoteRevokeSession, remoteUserForToken, requestSupabaseAuthCode } from './supabase-auth.js';
+import { remoteRevokeSession, remoteUserForToken } from './supabase-auth.js';
 
 const DEMO_EMAIL = 'demo@synau.local';
 const DEMO_CODE = '020599';
@@ -191,7 +191,9 @@ function challengeResponse(challengeId: string, email: string, expiresAt: string
 }
 
 export async function requestAuthCode(input: AuthCodeRequest) {
-  if (isSupabaseStorage()) return requestSupabaseAuthCode(input);
+  if (isSupabaseStorage()) {
+    throw new AuthFlowError('Google sign-in is the only authentication method for this Synau environment.', 410, 'google_auth_only');
+  }
   const isSignUp = input.mode === 'sign_up';
   const identifier = isSignUp ? normalizeEmail(input.email) : input.identifier.trim().toLowerCase();
   const user = isSignUp ? undefined : getUserByLoginIdentifier(identifier);

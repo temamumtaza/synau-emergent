@@ -12,6 +12,35 @@ export const UserSchema = z.object({
 });
 export type User = z.infer<typeof UserSchema>;
 
+export const GoogleAuthRequestSchema = z.object({
+  accessToken: z.string().trim().min(20).max(10_000),
+  firstName: z.string().trim().min(1).max(60).optional(),
+  lastName: z.string().trim().min(1).max(60).optional(),
+  username: z.string().trim().min(3).max(32).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,30}[a-zA-Z0-9]$/, 'Username must use letters, numbers, dots, underscores, or hyphens.').optional(),
+}).strict();
+export type GoogleAuthRequest = z.infer<typeof GoogleAuthRequestSchema>;
+
+const GoogleProfileSuggestionSchema = z.object({
+  email: z.string().email(),
+  firstName: z.string().max(60),
+  lastName: z.string().max(60),
+  username: z.string().min(3).max(32),
+}).strict();
+
+export const GoogleAuthResponseSchema = z.discriminatedUnion('status', [
+  z.object({
+    status: z.literal('profile_required'),
+    profile: GoogleProfileSuggestionSchema,
+  }).strict(),
+  z.object({
+    status: z.literal('authenticated'),
+    token: z.string().min(20),
+    user: UserSchema,
+    created: z.boolean(),
+  }).strict(),
+]);
+export type GoogleAuthResponse = z.infer<typeof GoogleAuthResponseSchema>;
+
 export const AuthCodePurposeSchema = z.enum(['sign_in', 'sign_up']);
 export type AuthCodePurpose = z.infer<typeof AuthCodePurposeSchema>;
 

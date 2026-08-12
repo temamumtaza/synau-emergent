@@ -9,6 +9,7 @@ import { ProductProgressPage } from './components/ProductProgressPage';
 import { CreditsPage } from './components/CreditsPage';
 import { CourseWorkspace } from './components/CourseWorkspace';
 import type { User } from './types';
+import { signOutGoogle } from './supabase';
 
 type AuthState =
   | { status: 'checking'; user: null }
@@ -217,6 +218,7 @@ export function App() {
     } catch {
       // A local sign-out should still succeed when the session has already expired.
     } finally {
+      await signOutGoogle().catch(() => undefined);
       clearToken();
       setAuth({ status: 'anonymous', user: null });
       navigate('/');
