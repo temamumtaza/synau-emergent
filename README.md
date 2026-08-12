@@ -46,6 +46,18 @@ npm run migrate:supabase                  # reads .data/synau.db and writes Supa
 
 `npm run migrate:supabase` preserves Synau IDs, creates or maps Supabase Auth users, migrates courses, sections, lazy lesson material, quiz attempts, progress events, credits, LLM usage, top-ups, sessions, and auth challenges, then verifies row counts. The checked-in migration is [supabase/migrations/20260812113729_synau_core_schema.sql](/Users/temamumtaza/Documents/synau2026/supabase/migrations/20260812113729_synau_core_schema.sql). Set `SYNAU_STORAGE=sqlite` and run `npm run seed` only when intentionally using the local fallback.
 
+### Supabase email-code delivery
+
+Synau uses Supabase Auth's six-digit email OTP in Supabase mode. The hosted project's default mailer is rate-limited and is not a production delivery service, so configure a real SMTP provider before testing with a normal learner address. The versioned Synau template is [supabase/templates/auth-otp.html](/Users/temamumtaza/Documents/synau2026/supabase/templates/auth-otp.html); it deliberately uses `{{ .Token }}` and does not include `{{ .ConfirmationURL }}`, so Supabase sends a code rather than a magic link.
+
+For a repeatable hosted setup, add a Supabase Personal Access Token and SMTP values to your local `.env`, then run:
+
+```bash
+npm run auth:configure
+```
+
+The command patches the linked project's Auth SMTP and both confirmation/OTP templates through the Supabase Management API. `SUPABASE_SECRET_KEY` cannot perform this configuration; do not paste either token into source control or the browser bundle. The dashboard equivalent is Authentication → SMTP Settings and Authentication → Email Templates. After configuration, restart the local Synau server and request a fresh code. The demo account remains local to Synau and uses `020599` without sending email.
+
 ## Verification
 
 ```bash

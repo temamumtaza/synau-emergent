@@ -62,6 +62,54 @@ function maskEmail(email: string) {
   return `${visible}${'*'.repeat(Math.max(2, local.length - visible.length))}@${domain}`;
 }
 
+type SupabaseEmailError = {
+  code?: string | null;
+  message?: string | null;
+  status?: number | null;
+};
+
+function authEmailError(error: SupabaseEmailError) {
+  const code = String(error.code ?? '').toLowerCase();
+  const message = String(error.message ?? '').toLowerCase();
+
+  // Keep provider details in server logs while returning a useful, safe next
+  // step to the learner. In particular, Supabase's default hosted mailer is
+  // intentionally limited and commonly reports either a rate limit or an
+  // authorization/configuration failure here.
+  console.warn(`[auth-email:supabase] delivery failed code=${code || 'unknown'} status=${error.status ?? 'unknown'} message=${error.message ?? 'unknown'}`);
+
+  if (code === 'over_email_send_rate_limit' || message.includes('rate limit')) {
+    return new AuthFlowError(
+      'Email delivery is temporarily rate-limited. Wait for the limit to reset before requesting another code.',
+      429,
+      'email_rate_limited',
+    );
+  }
+
+  if (code === 'email_address_invalid') {
+    return new AuthFlowError('Supabase rejected this email address. Check it and try again.', 400, 'email_address_invalid');
+  }
+
+  if (
+    code === 'email_address_not_authorized'
+    || message.includes('not authorized')
+    || message.includes('not allowed')
+    || message.includes('pre-authorized')
+  ) {
+    return new AuthFlowError(
+      'This project is not configured to deliver email to this address yet. Configure Custom SMTP in Supabase Auth, then try again.',
+      503,
+      'email_provider_not_configured',
+    );
+  }
+
+  return new AuthFlowError(
+    'We could not send the verification email. Configure Custom SMTP in Supabase Auth and try again.',
+    503,
+    'email_delivery_failed',
+  );
+}
+
 function profileUser(profile: RemoteProfile): UserRecord {
   return {
     id: profile.id,
@@ -167,7 +215,7 @@ export async function requestSupabaseAuthCode(input: AuthCodeRequest) {
   });
   if (error) {
     await read(getSupabaseAdmin().from('auth_challenges').delete().eq('id', challengeId));
-    throw new AuthFlowError('We could not send the verification email. Please try again shortly.', 503, 'email_delivery_failed');
+    throw authEmailError(error);
   }
   return challengeResponse(challengeId, email, expiresAt, false, `We sent a verification code to ${maskEmail(email)}.`);
 }
