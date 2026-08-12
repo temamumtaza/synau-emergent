@@ -199,6 +199,7 @@ function respondWithAuthError(res: Response, error: unknown) {
     res.status(error.status).json({ error: error.message, code: error.code });
     return;
   }
+  console.error('[auth] unexpected authentication failure', error instanceof Error ? error.message : error);
   res.status(503).json({ error: 'Authentication service is temporarily unavailable.', code: 'auth_service_unavailable' });
 }
 
@@ -366,7 +367,10 @@ app.post('/api/auth/google/session', async (req, res) => {
   try {
     const result = await completeSupabaseGoogleAuth(body);
     if (result.status === 'authenticated' && result.created) await remoteGrantNewUserCredits(result.user.id);
-    res.json(GoogleAuthResponseSchema.parse(result));
+    const response = result.status === 'authenticated'
+      ? { ...result, user: UserSchema.parse(publicUser(result.user)) }
+      : result;
+    res.json(GoogleAuthResponseSchema.parse(response));
   } catch (error) {
     respondWithAuthError(res, error);
   }
