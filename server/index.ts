@@ -12,12 +12,10 @@ import {
   revokeSession,
   AuthFlowError,
   publicUser,
-  requestAuthCode,
-  verifyAuthCode,
   type AuthRequest,
 } from './auth.js';
 import { generateLesson, generateQuiz, generateRoadmap } from './ai.js';
-import { billingStatusCode, createCreditTopUp, getCreditSummary, grantNewUserCredits, handleMidtransNotification, redeemCreditToken, syncCreditTopUp } from './credits.js';
+import { billingStatusCode, createCreditTopUp, getCreditSummary, handleMidtransNotification, redeemCreditToken, syncCreditTopUp } from './credits.js';
 import { isSupabaseStorage } from './supabase.js';
 import { completeSupabaseGoogleAuth, remoteGetUserById, remoteRevokeSession } from './supabase-auth.js';
 import { performanceMiddleware } from './performance.js';
@@ -53,8 +51,6 @@ import {
 import {
   CourseSchema,
   CoursePatchSchema,
-  AuthCodeRequestSchema,
-  AuthCodeVerifySchema,
   GoogleAuthRequestSchema,
   GoogleAuthResponseSchema,
   createQuizSubmissionSchema,
@@ -470,12 +466,12 @@ app.get('/healthz', async (_req, res) => {
 });
 
 app.get('/api/auth/config', (_req, res) => {
-  res.json({ provider: isSupabaseStorage() ? 'google' : 'email' });
+  res.json({ provider: 'google' as const });
 });
 
 app.post('/api/auth/google/session', async (req, res) => {
   if (!isSupabaseStorage()) {
-    res.status(410).json({ error: 'Google sign-in is available only in Supabase mode.', code: 'google_auth_unavailable' });
+    res.status(503).json({ error: 'Google sign-in requires Supabase storage. Configure SYNAU_STORAGE=supabase and restart the server.', code: 'google_auth_requires_supabase' });
     return;
   }
   const body = parseBody(GoogleAuthRequestSchema, req, res);
@@ -493,33 +489,11 @@ app.post('/api/auth/google/session', async (req, res) => {
 });
 
 app.post('/api/auth/request-code', async (req, res) => {
-  if (isSupabaseStorage()) {
-    res.status(410).json({ error: 'Google sign-in is the only authentication method for this Synau environment.', code: 'google_auth_only' });
-    return;
-  }
-  const body = parseBody(AuthCodeRequestSchema, req, res);
-  if (!body) return;
-  try {
-    res.json(await requestAuthCode(body));
-  } catch (error) {
-    respondWithAuthError(res, error);
-  }
+  res.status(410).json({ error: 'Google sign-in is the only authentication method for Synau.', code: 'google_auth_only' });
 });
 
 app.post('/api/auth/verify-code', async (req, res) => {
-  if (isSupabaseStorage()) {
-    res.status(410).json({ error: 'Google sign-in is the only authentication method for this Synau environment.', code: 'google_auth_only' });
-    return;
-  }
-  const body = parseBody(AuthCodeVerifySchema, req, res);
-  if (!body) return;
-  try {
-    const result = verifyAuthCode(body);
-    if (result.created) grantNewUserCredits(result.user.id);
-    res.json({ token: result.token, user: UserSchema.parse(publicUser(result.user)) });
-  } catch (error) {
-    respondWithAuthError(res, error);
-  }
+  res.status(410).json({ error: 'Google sign-in is the only authentication method for Synau.', code: 'google_auth_only' });
 });
 
 app.post('/api/auth/logout', requireAuth, async (req, res) => {

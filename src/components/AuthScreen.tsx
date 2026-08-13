@@ -481,23 +481,5 @@ function AuthLoading() {
 }
 
 export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
-  const [provider, setProvider] = useState<'loading' | 'google' | 'email'>('loading');
-
-  useEffect(() => {
-    let active = true;
-    api.authConfig()
-      .then(({ provider: configuredProvider }) => {
-        if (active) setProvider(configuredProvider);
-      })
-      .catch(() => {
-        if (active) {
-          setProvider('google');
-        }
-      });
-    return () => { active = false; };
-  }, []);
-
-  if (provider === 'loading') return <AuthLoading />;
-  if (provider === 'email') return <EmailAuthScreen onAuthenticated={onAuthenticated} />;
   return <GoogleAuthScreen onAuthenticated={onAuthenticated} />;
 }
