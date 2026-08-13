@@ -278,12 +278,30 @@ function EmailAuthScreen({ onAuthenticated }: AuthScreenProps) {
   );
 }
 
+function GoogleMark() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="google-auth-button__icon"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path fill="#4285F4" d="M21.35 12.27c0-.79-.07-1.55-.2-2.27H12v4.3h5.24a4.48 4.48 0 0 1-1.94 2.94v2.45h3.14c1.84-1.69 2.91-4.18 2.91-7.42Z" />
+      <path fill="#34A853" d="M12 21.5c2.63 0 4.84-.87 6.45-2.36l-3.14-2.45c-.87.58-1.98.92-3.31.92-2.54 0-4.69-1.71-5.46-4.01H3.3v2.52A9.74 9.74 0 0 0 12 21.5Z" />
+      <path fill="#FBBC05" d="M6.54 13.6A5.87 5.87 0 0 1 6.23 12c0-.56.1-1.1.31-1.6V7.88H3.3A9.74 9.74 0 0 0 2.25 12c0 1.57.38 3.05 1.05 4.12l3.24-2.52Z" />
+      <path fill="#EA4335" d="M12 6.39c1.43 0 2.71.49 3.72 1.45l2.79-2.79C16.84 3.48 14.63 2.5 12 2.5a9.74 9.74 0 0 0-8.7 5.38l3.24 2.52C7.31 8.1 9.46 6.39 12 6.39Z" />
+    </svg>
+  );
+}
+
 function GoogleButton({ disabled, onClick }: { disabled: boolean; onClick: () => void }) {
   return (
     <button className="google-auth-button" disabled={disabled} onClick={onClick} type="button">
-      <span className="google-auth-button__mark" aria-hidden="true">G</span>
-      <span>{disabled ? 'Opening Google' : 'Continue with Google'}</span>
-      {disabled ? <span className="spinner" aria-hidden="true" /> : <Icon name="arrow-right" />}
+      <span className="google-auth-button__side google-auth-button__side--leading"><GoogleMark /></span>
+      <span className="google-auth-button__label">{disabled ? 'Opening Google' : 'Continue with Google'}</span>
+      <span className="google-auth-button__side google-auth-button__side--trailing">
+        {disabled ? <span className="spinner" aria-hidden="true" /> : <Icon name="arrow-right" />}
+      </span>
     </button>
   );
 }

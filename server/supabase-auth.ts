@@ -1,6 +1,8 @@
+import crypto from 'node:crypto';
 import type { GoogleAuthRequest } from '../shared/schemas.js';
 import { newId, nowIso } from './db.js';
 import { getSupabaseAdmin } from './supabase.js';
+import { recordSupabaseQuery } from './performance.js';
 import type { UserRecord } from './auth.js';
 import { AuthFlowError, normalizeUsername } from './auth.js';
 
@@ -21,8 +23,18 @@ type GoogleAuthUser = {
   app_metadata?: Record<string, unknown> | null;
 };
 
+const verifiedTokenCache = new Map<string, { expiresAt: number; user: UserRecord | undefined }>();
+const verifiedTokenFlights = new Map<string, Promise<UserRecord | undefined>>();
+const verifiedTokenCacheMs = Math.max(0, Math.min(30_000, Number(process.env.SYNAU_AUTH_CACHE_MS ?? 5_000)));
+
 async function read<T>(query: PromiseLike<{ data: T; error: { message: string } | null }>) {
-  const result = await query;
+  const startedAt = performance.now();
+  let result: { data: T; error: { message: string } | null };
+  try {
+    result = await query;
+  } finally {
+    recordSupabaseQuery(performance.now() - startedAt);
+  }
   if (result.error) throw new Error(`Supabase auth query failed: ${result.error.message}`);
   return result.data;
 }
@@ -110,7 +122,9 @@ function hasGoogleIdentity(user: GoogleAuthUser) {
 }
 
 async function verifiedGoogleUser(accessToken: string) {
+  const startedAt = performance.now();
   const { data, error } = await getSupabaseAdmin().auth.getUser(accessToken);
+  recordSupabaseQuery(performance.now() - startedAt);
   if (error || !data.user) {
     throw new AuthFlowError('Google sign-in could not be verified. Start again from the Google button.', 401, 'google_token_invalid');
   }
@@ -181,12 +195,51 @@ export async function completeSupabaseGoogleAuth(input: GoogleAuthRequest) {
 }
 
 export async function remoteUserForToken(token: string) {
-  const { data } = await getSupabaseAdmin().auth.getUser(token);
-  if (data.user) return hasGoogleIdentity(data.user as GoogleAuthUser) ? remoteGetUserByAuthId(data.user.id) : undefined;
-  const session = await read(getSupabaseAdmin().from('sessions').select('user_id').eq('token', token).gt('expires_at', nowIso()).maybeSingle<{ user_id: string }>()).catch(() => null);
-  return session ? remoteGetUserById(session.user_id) : undefined;
+  const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
+  const cached = verifiedTokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.user;
+  if (cached) verifiedTokenCache.delete(cacheKey);
+
+  const existingFlight = verifiedTokenFlights.get(cacheKey);
+  if (existingFlight) return existingFlight;
+  const flight = remoteUserForTokenUncached(token, cacheKey).finally(() => {
+    if (verifiedTokenFlights.get(cacheKey) === flight) verifiedTokenFlights.delete(cacheKey);
+  });
+  verifiedTokenFlights.set(cacheKey, flight);
+  return flight;
+}
+
+async function remoteUserForTokenUncached(token: string, cacheKey: string) {
+
+  let user: UserRecord | undefined;
+  // Application sessions are UUIDs, while Supabase Auth access tokens are JWTs.
+  // Avoid a guaranteed remote Auth lookup for our own session format.
+  if (token.split('.').length === 3) {
+    const startedAt = performance.now();
+    const { data } = await getSupabaseAdmin().auth.getUser(token);
+    recordSupabaseQuery(performance.now() - startedAt);
+    user = data.user && hasGoogleIdentity(data.user as GoogleAuthUser)
+      ? await remoteGetUserByAuthId(data.user.id)
+      : undefined;
+  } else {
+    const session = await read(getSupabaseAdmin()
+      .from('sessions')
+      .select('user_id, users(id, auth_user_id, email, first_name, last_name, username, name)')
+      .eq('token', token)
+      .gt('expires_at', nowIso())
+      .maybeSingle<{ user_id: string; users: RemoteProfile | null }>()).catch(() => null);
+    user = session?.users ? profileUser(session.users) : undefined;
+  }
+
+  if (verifiedTokenCacheMs > 0) {
+    verifiedTokenCache.set(cacheKey, { expiresAt: Date.now() + verifiedTokenCacheMs, user });
+  }
+  return user;
 }
 
 export async function remoteRevokeSession(token: string) {
   await read(getSupabaseAdmin().from('sessions').delete().eq('token', token));
+  const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
+  verifiedTokenCache.delete(cacheKey);
+  verifiedTokenFlights.delete(cacheKey);
 }

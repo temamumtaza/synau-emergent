@@ -10,7 +10,7 @@ page.on('response', (response) => { if (response.status() >= 500) errors.push(`h
 
 try {
   await page.goto(appUrl, { waitUntil: 'domcontentloaded' });
-  await page.getByLabel('Email or username').fill('demo@synau.local');
+  await page.locator('input[placeholder="you@example.com or username"]').fill('demo@synau.local');
   await page.getByRole('button', { name: /send sign-in code/i }).click();
   await page.getByLabel('Verification code').fill('020599');
   await page.getByRole('button', { name: /verify and continue/i }).click();
@@ -27,7 +27,8 @@ try {
   await expect(page.getByText('25 bonus', { exact: false })).toBeVisible();
   await expect(page.getByText('50 bonus', { exact: false })).toBeVisible();
   await expect(page.getByText('New account: +100 free', { exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: /top up with midtrans/i }).first()).toBeEnabled();
+  await expect(page.getByRole('button', { name: /top up locked/i }).first()).toBeDisabled();
+  await expect(page.getByRole('heading', { name: 'Redeem a credit token' })).toBeVisible();
   const authRoutesRemoved = await page.request.post(`${appUrl}/api/auth/login`, { data: { email: 'demo@synau.local', password: 'legacy-password' } });
   expect([404, 405]).toContain(authRoutesRemoved.status());
   await page.screenshot({ path: 'quality/credits-final.png', fullPage: true });
@@ -35,7 +36,7 @@ try {
   console.log(JSON.stringify({ ok: true, assertions: [
     'backend-credit-balance',
     'fixed-sumopod-provider',
-    'four-midtrans-top-up-packages',
+    'four-locked-top-up-packages',
     'password-routes-removed',
   ], screenshot: 'quality/credits-final.png' }, null, 2));
 } finally {

@@ -1,55 +1,16 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
-import type { CreditSummary, TopUpResponse } from '../types';
-import { Icon } from './Icon';
-
-declare global {
-  interface Window {
-    snap?: {
-      pay: (token: string, callbacks: {
-        onSuccess?: () => void;
-        onPending?: () => void;
-        onError?: () => void;
-        onClose?: () => void;
-      }) => void;
-    };
-  }
-}
+import type { CreditSummary } from '../types';
 
 const formatter = new Intl.NumberFormat('id-ID');
-
-function loadSnapScript(topUp: TopUpResponse) {
-  return new Promise<void>((resolve, reject) => {
-    if (window.snap) {
-      resolve();
-      return;
-    }
-    const existing = document.getElementById('midtrans-snap-script') as HTMLScriptElement | null;
-    if (existing) {
-      existing.addEventListener('load', () => resolve(), { once: true });
-      existing.addEventListener('error', () => reject(new Error('Midtrans checkout could not be loaded.')), { once: true });
-      return;
-    }
-    const script = document.createElement('script');
-    script.id = 'midtrans-snap-script';
-    script.src = topUp.environment === 'production'
-      ? 'https://app.midtrans.com/snap/snap.js'
-      : 'https://app.sandbox.midtrans.com/snap/snap.js';
-    script.dataset.clientKey = topUp.clientKey;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error('Midtrans checkout could not be loaded.'));
-    document.body.appendChild(script);
-  });
-}
 
 export function CreditsPage() {
   const [summary, setSummary] = useState<CreditSummary | null>(null);
   const [loading, setLoading] = useState(true);
-  const [topUp, setTopUp] = useState<TopUpResponse | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [redeemToken, setRedeemToken] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
 
   async function loadCredits() {
     const result = await api.credits();
@@ -71,42 +32,19 @@ export function CreditsPage() {
     return () => { active = false; };
   }, []);
 
-  async function refreshStatus(topUpId: string) {
-    setRefreshing(true);
-    try {
-      const result = await api.creditTopUpStatus(topUpId);
-      setSummary(result.credits);
-      setMessage(result.status === 'paid' ? 'Payment confirmed. Credits have been added.' : 'Payment is still waiting for confirmation.');
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not refresh payment status.');
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
-  async function startTopUp(productId: string) {
-    setBusy(true);
+  async function redeem() {
+    setRedeeming(true);
     setError('');
     setMessage('');
-    let createdTopUp: TopUpResponse | null = null;
     try {
-      const result = await api.createCreditTopUp(productId);
-      createdTopUp = result.topUp;
-      setTopUp(createdTopUp);
-      await loadSnapScript(createdTopUp);
-      if (!window.snap) throw new Error('Midtrans checkout is unavailable in this browser.');
-      window.snap.pay(createdTopUp.snapToken, {
-        onSuccess: () => void refreshStatus(createdTopUp!.topUpId),
-        onPending: () => setMessage('Payment is pending. You can refresh the status after completing it.'),
-        onError: () => setError('Midtrans could not complete this payment.'),
-        onClose: () => setMessage('Checkout closed. If you completed payment, refresh its status below.'),
-      });
+      const result = await api.redeemCreditToken(redeemToken);
+      await loadCredits();
+      setRedeemToken('');
+      setMessage(result.redemption.alreadyRedeemed ? 'This token was already claimed on this account.' : `${formatter.format(result.redemption.creditsAdded)} credits added.`);
     } catch (requestError) {
-      const fallbackUrl = createdTopUp?.redirectUrl;
-      if (fallbackUrl) window.location.assign(fallbackUrl);
-      else setError(requestError instanceof Error ? requestError.message : 'Could not start the credit top-up.');
+      setError(requestError instanceof Error ? requestError.message : 'Could not redeem this token.');
     } finally {
-      setBusy(false);
+      setRedeeming(false);
     }
   }
 
@@ -151,6 +89,18 @@ export function CreditsPage() {
               <small>credits</small>
             </div>
 
+            <form className="credit-redeem" onSubmit={(event) => { event.preventDefault(); void redeem(); }}>
+              <div>
+                <span className="eyebrow">Reviewer access</span>
+                <h3>Redeem a credit token</h3>
+                <p>Enter the personal token shared with you. Each token can be claimed once per account.</p>
+              </div>
+              <div className="credit-redeem__controls">
+                <input aria-label="Redeem token" autoCapitalize="characters" placeholder="Enter redeem token" value={redeemToken} onChange={(event) => setRedeemToken(event.target.value)} />
+                <button className="button button--primary" disabled={redeeming || redeemToken.trim().length < 8} type="submit">{redeeming ? 'Redeeming' : 'Redeem token'}</button>
+              </div>
+            </form>
+
             <div className="credit-products" aria-label="Credit top-up packages">
               <div className="credit-products__intro">
                 <div>
@@ -170,25 +120,16 @@ export function CreditsPage() {
                     <strong>Rp{formatter.format(product.amountIdr)}</strong>
                     <small>{formatter.format(product.credits)} credits total</small>
                   </div>
-                  <button className="button button--primary" disabled={busy} onClick={() => void startTopUp(product.id)} type="button">
-                    {busy ? <><span className="spinner spinner--light" />Opening checkout</> : <>Top up with Midtrans <Icon name="arrow-right" /></>}
+                  <button className="button button--secondary" disabled type="button">
+                    Top up locked
                   </button>
                 </article>
               ))}
             </div>
 
-            {topUp && (
-              <div className="credit-payment-status">
-                <div>
-                  <span className="eyebrow">Latest top-up</span>
-                  <strong>{topUp.orderId}</strong>
-                  <p>Status is confirmed by the Midtrans notification endpoint.</p>
-                </div>
-                <button className="button button--secondary" disabled={refreshing} onClick={() => void refreshStatus(topUp.topUpId)} type="button">
-                  {refreshing ? 'Refreshing' : 'Refresh status'}
-                </button>
-              </div>
-            )}
+            <div className="credit-payment-status credit-payment-status--locked">
+              <div><span className="eyebrow">Top-up payments</span><strong>Temporarily locked</strong><p>Payment checkout is being prepared. Reviewers can use a personal redeem token instead.</p></div>
+            </div>
           </div>
         </section>
 

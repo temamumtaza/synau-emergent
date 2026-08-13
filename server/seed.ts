@@ -25,11 +25,12 @@ if (!existing) {
   const courseId = newId();
   const sectionId = newId();
   const createdAt = nowIso();
-  db.prepare(`INSERT INTO courses (id, user_id, topic, title, description, outcomes_json, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`).run(
+  db.prepare(`INSERT INTO courses (id, user_id, topic, language, title, description, outcomes_json, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`).run(
     courseId,
     user.id,
     'Writing better product briefs',
+    'en',
     'Writing better product briefs: a practical learning path',
     'A seeded course that demonstrates an existing learner state while new courses can still be created from a topic.',
     json(['Frame a product problem clearly', 'Make a brief useful to collaborators', 'Use feedback to improve a decision']),

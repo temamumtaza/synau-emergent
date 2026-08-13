@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { getSupabaseAdmin } from './supabase.js';
 import { remoteGetUserById } from './supabase-auth.js';
+import { recordSupabaseQuery } from './performance.js';
 import { createSnapToken, getMidtransTransactionStatus } from './midtrans.js';
 import {
   CreditSummarySchema,
@@ -15,7 +16,14 @@ import {
 const demoCredits = Math.max(0, Math.floor(Number(process.env.SYNAU_DEMO_CREDITS ?? 10_000)));
 const GENERATOR_CREDIT_COST = 1;
 const STALE_HOLD_RECOVERY_MS = 15 * 60 * 1_000;
+const CREDIT_ENSURE_CACHE_MS = 30_000;
+const REVIEWER_PROMO_CACHE_MS = 300_000;
 export const REMOTE_NEW_USER_FREE_CREDITS = 100;
+const REMOTE_PROMO_CREDITS = 1_500;
+const ensuredCreditUsers = new Map<string, number>();
+const ensuringCreditUsers = new Map<string, Promise<void>>();
+let reviewerPromoReadyUntil = 0;
+let reviewerPromoFlight: Promise<void> | undefined;
 
 export const REMOTE_CREDIT_PRODUCTS: CreditProduct[] = [
   { id: 'topup-15000', label: '1.500 credits', baseCredits: 1_500, bonusCredits: 0, credits: 1_500, amountIdr: 15_000 },
@@ -31,8 +39,14 @@ export class RemoteCreditError extends Error {
   }
 }
 
-async function read<T>(query: PromiseLike<{ data: T; error: { message: string; code?: string } | null }>) {
-  const result = await query;
+async function read<T>(query: PromiseLike<{ data: T; error: { message: string; code?: string } | null }>, kind: 'operation' | 'support' = 'support') {
+  const startedAt = performance.now();
+  let result: { data: T; error: { message: string; code?: string } | null };
+  try {
+    result = await query;
+  } finally {
+    recordSupabaseQuery(performance.now() - startedAt, kind);
+  }
   if (result.error) throw new RemoteCreditError(502, 'supabase_credit_query_failed', result.error.message);
   return result.data;
 }
@@ -78,7 +92,22 @@ async function applyCreditDelta(args: {
   }
 }
 
-async function ensureCredits(userId: string) {
+async function ensureReviewerPromoCode() {
+  if (reviewerPromoReadyUntil > Date.now()) return;
+  if (reviewerPromoFlight) return reviewerPromoFlight;
+  reviewerPromoFlight = (async () => {
+    const existing = await read(getSupabaseAdmin().from('credit_promo_codes').select('id').eq('active', true).eq('credits', REMOTE_PROMO_CREDITS).limit(1).maybeSingle<{ id: string }>());
+    if (!existing) {
+      const token = `SYN-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+      await read(getSupabaseAdmin().from('credit_promo_codes').insert({ id: uuid(), token, credits: REMOTE_PROMO_CREDITS, active: true, max_redemptions: 1, redeemed_count: 0, created_at: now() }));
+    }
+    reviewerPromoReadyUntil = Date.now() + REVIEWER_PROMO_CACHE_MS;
+  })().finally(() => { reviewerPromoFlight = undefined; });
+  return reviewerPromoFlight;
+}
+
+async function ensureCreditsUncached(userId: string) {
+  await ensureReviewerPromoCode();
   await read(getSupabaseAdmin().from('credit_accounts').upsert({ user_id: userId, balance: 0, updated_at: now() }, { onConflict: 'user_id', ignoreDuplicates: true }));
   const [user, staleHolds] = await Promise.all([
     remoteGetUserById(userId),
@@ -112,6 +141,42 @@ async function ensureCredits(userId: string) {
   }
 }
 
+async function ensureCredits(userId: string) {
+  const cachedUntil = ensuredCreditUsers.get(userId);
+  if (cachedUntil && cachedUntil > Date.now()) return;
+  if (cachedUntil) ensuredCreditUsers.delete(userId);
+  const existingFlight = ensuringCreditUsers.get(userId);
+  if (existingFlight) return existingFlight;
+  const flight = ensureCreditsUncached(userId)
+    .then(() => { ensuredCreditUsers.set(userId, Date.now() + CREDIT_ENSURE_CACHE_MS); })
+    .finally(() => { ensuringCreditUsers.delete(userId); });
+  ensuringCreditUsers.set(userId, flight);
+  return flight;
+}
+
+export async function remoteRedeemCreditToken(userId: string, rawToken: string) {
+  const token = rawToken.trim().toUpperCase();
+  if (!token) throw new RemoteCreditError(400, 'invalid_redeem_token', 'Enter a redeem token.');
+  await ensureCredits(userId);
+  const promo = await read(getSupabaseAdmin().from('credit_promo_codes').select('id, credits, max_redemptions, redeemed_count').eq('token', token).eq('active', true).maybeSingle<{ id: string; credits: number; max_redemptions: number; redeemed_count: number }>());
+  if (!promo) throw new RemoteCreditError(400, 'invalid_redeem_token', 'This redeem token is invalid or inactive.');
+  const existing = await read(getSupabaseAdmin().from('credit_promo_redemptions').select('id').eq('promo_code_id', promo.id).eq('user_id', userId).maybeSingle<{ id: string }>());
+  if (existing) {
+    const account = await read(getSupabaseAdmin().from('credit_accounts').select('balance').eq('user_id', userId).single<{ balance: number }>());
+    if (!account) throw new RemoteCreditError(503, 'credit_account_unavailable', 'Credit account is temporarily unavailable.');
+    return { creditsAdded: 0, alreadyRedeemed: true, balance: account.balance };
+  }
+  if (promo.redeemed_count >= promo.max_redemptions) throw new RemoteCreditError(409, 'redeem_token_exhausted', 'This redeem token has already been claimed.');
+  const redemptionId = uuid();
+  await read(getSupabaseAdmin().from('credit_promo_redemptions').insert({ id: redemptionId, promo_code_id: promo.id, user_id: userId, credits: promo.credits, created_at: now() }));
+  await read(getSupabaseAdmin().from('credit_promo_codes').update({ redeemed_count: promo.redeemed_count + 1 }).eq('id', promo.id));
+  await applyCreditDelta({ userId, delta: promo.credits, type: 'grant', referenceId: `promo:${redemptionId}:credit`, description: `Redeem token credit grant (${promo.credits.toLocaleString('id-ID')} credits)`, metadata: { redemptionId, promoCodeId: promo.id } });
+  const account = await read(getSupabaseAdmin().from('credit_accounts').select('balance').eq('user_id', userId).single<{ balance: number }>());
+  if (!account) throw new RemoteCreditError(503, 'credit_account_unavailable', 'Credit account is temporarily unavailable.');
+  ensuredCreditUsers.delete(userId);
+  return { creditsAdded: promo.credits, alreadyRedeemed: false, balance: account.balance };
+}
+
 export async function remoteGrantCredits(args: { userId: string; credits: number; referenceId: string; description: string; type?: 'grant' | 'topup' | 'adjustment'; metadata?: unknown }) {
   if (!Number.isInteger(args.credits) || args.credits <= 0) throw new RemoteCreditError(400, 'invalid_credit_grant', 'Credit grant must be a positive integer.');
   await applyCreditDelta({ ...args, delta: args.credits, type: args.type ?? 'adjustment' });
@@ -122,17 +187,20 @@ export async function remoteGrantNewUserCredits(userId: string) {
 }
 
 export async function remoteGetCreditSummary(userId: string): Promise<CreditSummary> {
-  await ensureCredits(userId);
-  const account = await read(getSupabaseAdmin().from('credit_accounts').select('balance').eq('user_id', userId).single<{ balance: number }>());
-  if (!account) throw new RemoteCreditError(503, 'credit_account_unavailable', 'Credit account is temporarily unavailable.');
-  const rows = await read(getSupabaseAdmin().from('credit_ledger').select('id, type, delta, description, created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(20));
+  const summary = await read(getSupabaseAdmin().rpc('get_credit_summary_json', { p_user_id: userId }), 'operation') as {
+    balance?: unknown;
+    recentTransactions?: unknown;
+  } | null;
+  if (!summary || typeof summary.balance !== 'number' || !Array.isArray(summary.recentTransactions)) {
+    throw new RemoteCreditError(503, 'credit_account_unavailable', 'Credit account is temporarily unavailable.');
+  }
   return CreditSummarySchema.parse({
-    balance: account.balance,
+    balance: summary.balance,
     unit: 'credits',
     currencyNote: '1 generator = 1 credit. Top-ups use 100 credits per Rp1.000 plus up to 50 bonus credits. New accounts receive 100 free credits.',
     provider: providerSummary(),
     products: REMOTE_CREDIT_PRODUCTS,
-    recentTransactions: (rows as Array<{ id: string; type: string; delta: number; description: string; created_at: string }>).map((row) => CreditTransactionSchema.parse({ id: row.id, type: row.type, delta: row.delta, description: row.description, createdAt: row.created_at })),
+    recentTransactions: (summary.recentTransactions as Array<{ id?: unknown; type?: unknown; delta?: unknown; description?: unknown; createdAt?: unknown }>).map((row) => CreditTransactionSchema.parse({ id: row.id, type: row.type, delta: row.delta, description: row.description, createdAt: row.createdAt })),
   });
 }
 

@@ -48,13 +48,17 @@ export function LibraryPage({ onBack, onOpenCourse }: LibraryPageProps) {
 
   async function renameCourse(title: string) {
     if (!editingCourse) return;
+    const previousCourses = courses;
+    const optimisticCourse = { ...editingCourse, title };
     setManagerBusy('rename');
     setManagerError('');
+    setCourses((current) => current.map((item) => item.id === optimisticCourse.id ? optimisticCourse : item));
     try {
       const { course } = await api.renameCourse(editingCourse.id, title);
       setCourses((current) => current.map((item) => item.id === course.id ? course : item));
       setEditingCourse(null);
     } catch (error) {
+      setCourses(previousCourses);
       setManagerError(error instanceof Error ? error.message : 'Could not rename this learning path.');
     } finally {
       setManagerBusy(null);
@@ -63,13 +67,15 @@ export function LibraryPage({ onBack, onOpenCourse }: LibraryPageProps) {
 
   async function deleteCourse() {
     if (!deletingCourse) return;
+    const previousCourses = courses;
     setManagerBusy('delete');
     setManagerError('');
+    setCourses((current) => current.filter((item) => item.id !== deletingCourse.id));
     try {
       await api.deleteCourse(deletingCourse.id);
-      setCourses((current) => current.filter((item) => item.id !== deletingCourse.id));
       setDeletingCourse(null);
     } catch (error) {
+      setCourses(previousCourses);
       setManagerError(error instanceof Error ? error.message : 'Could not delete this course.');
     } finally {
       setManagerBusy(null);

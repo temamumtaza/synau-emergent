@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 import { api, ApiError } from '../api';
-import type { Course, CourseLesson, CourseSection, LessonMaterial, LessonNode, LessonWithSection, QuizScope } from '../types';
+import type { Course, CourseLesson, CourseSection, LessonArticleBlock, LessonMaterial, LessonNode, LessonWithSection, QuizScope } from '../types';
+import { CodeBlock, HighlightedCode } from './CodeBlock';
 import { Icon } from './Icon';
 import { QuizPanel, type QuizLaunch } from './QuizPanel';
 
@@ -27,7 +30,7 @@ function LessonLoading({ lesson }: { lesson: CourseLesson }) {
       <div className="lesson-loading__steps" aria-hidden="true">
         <span className="is-active"><i />Reading the lesson brief</span>
         <span><i />Building the explanation</span>
-        <span><i />Adding reflection and takeaway</span>
+        <span><i />Polishing the article and sources</span>
       </div>
       <div className="lesson-skeleton" aria-hidden="true">
         <span className="skeleton skeleton--title" />
@@ -44,7 +47,7 @@ function LessonLoading({ lesson }: { lesson: CourseLesson }) {
   );
 }
 
-function SectionRail({
+const SectionRail = memo(function SectionRail({
   course,
   onQuiz,
   onSelectLesson,
@@ -104,100 +107,133 @@ function SectionRail({
       </div>
     </aside>
   );
+});
+
+function CitationText({ text, sources }: { text: string; sources: LessonMaterial['sources'] }) {
+  const sourceIndex = new Map(sources.map((source, index) => [source.id, index + 1]));
+  return <>{text.split(/\[\[([^\]]+)\]\]/g).map((part, index) => {
+    if (index % 2 === 0) return part;
+    const source = sources.find((candidate) => candidate.id === part);
+    if (!source) return part;
+    return (
+      <a
+        aria-label={`Reference ${sourceIndex.get(source.id)}: ${source.title}`}
+        className="lesson-citation"
+        href={source.url}
+        key={`${source.id}-${index}`}
+        rel="noreferrer"
+        target="_blank"
+      >
+        [{sourceIndex.get(source.id)}]
+      </a>
+    );
+  })}</>;
 }
 
-function DataLab({ dataLab }: { dataLab: NonNullable<LessonMaterial['dataLab']> }) {
-  const [workedReadingRevealed, setWorkedReadingRevealed] = useState(false);
-  const titleId = useId();
-  const workedReadingId = useId();
-
+function EquationBlock({ block }: { block: Extract<LessonArticleBlock, { type: 'equation' }> }) {
+  const html = useMemo(() => katex.renderToString(block.latex, {
+    displayMode: true,
+    throwOnError: false,
+    trust: false,
+  }), [block.latex]);
   return (
-    <section className="data-lab" aria-labelledby={titleId}>
-      <div className="data-lab__header">
-        <div>
-          <h2 id={titleId}>{dataLab.title}</h2>
-        </div>
-      </div>
-
-      <div
-        aria-label={`${dataLab.title} data table`}
-        className="data-lab__table-wrap"
-        role="region"
-        tabIndex={0}
-      >
-        <table>
-          <caption>{dataLab.context}</caption>
-          <thead>
-            <tr>
-              {dataLab.columns.map((column) => <th key={column} scope="col">{column}</th>)}
-            </tr>
-          </thead>
-          <tbody>
-            {dataLab.rows.map((row, rowIndex) => (
-              <tr key={`${row[0]}-${rowIndex}`}>
-                {row.map((cell, cellIndex) => cellIndex === 0
-                  ? <th key={`${cell}-${cellIndex}`} scope="row">{cell}</th>
-                  : <td key={`${cell}-${cellIndex}`}>{cell}</td>)}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="data-lab__prompts">
-        <ol>
-          {dataLab.prompts.map((prompt) => <li key={prompt}>{prompt}</li>)}
-        </ol>
-      </div>
-
-      <div className="data-lab__reveal-row">
-        <button
-          aria-controls={workedReadingId}
-          aria-expanded={workedReadingRevealed}
-          className="data-lab__reveal"
-          onClick={() => setWorkedReadingRevealed((current) => !current)}
-          type="button"
-        >
-          <Icon name={workedReadingRevealed ? 'eye-off' : 'eye'} size={16} />
-          {workedReadingRevealed ? 'Hide worked reading' : 'Reveal worked reading'}
-        </button>
-      </div>
-
-      <div className="data-lab__worked" hidden={!workedReadingRevealed} id={workedReadingId}>
-        <p>{dataLab.workedReading}</p>
-      </div>
-    </section>
+    <figure className="lesson-rich-block lesson-rich-block--equation">
+      <div dangerouslySetInnerHTML={{ __html: html }} />
+      {block.caption && <figcaption>{block.caption}</figcaption>}
+    </figure>
   );
 }
 
-function ArticleBody({ article, sources }: Pick<LessonMaterial, 'article' | 'sources'>) {
-  const sourceIndex = new Map(sources.map((source, index) => [source.id, index + 1]));
-  function renderParagraph(text: string) {
-    return text.split(/\[\[([^\]]+)\]\]/g).map((part, index) => {
-      if (index % 2 === 0) return part;
-      const source = sources.find((candidate) => candidate.id === part);
-      if (!source) return part;
-      return (
-        <a
-          aria-label={`Reference ${sourceIndex.get(source.id)}: ${source.title}`}
-          className="lesson-citation"
-          href={source.url}
-          key={`${source.id}-${index}`}
-          rel="noreferrer"
-          target="_blank"
-        >
-          [{sourceIndex.get(source.id)}]
-        </a>
-      );
-    });
-  }
+function MermaidBlock({ block }: { block: Extract<LessonArticleBlock, { type: 'mermaid' }> }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const renderId = `synau-mermaid-${useId().replace(/:/g, '')}`;
+  const [error, setError] = useState(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    setError(false);
+    void import('mermaid').then(async ({ default: mermaid }) => {
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        theme: 'base',
+        themeVariables: {
+          background: '#fbfbf8',
+          primaryColor: '#f1f1ec',
+          primaryTextColor: '#171716',
+          primaryBorderColor: '#9c9c94',
+          lineColor: '#676761',
+          secondaryColor: '#f7f7f3',
+          tertiaryColor: '#ffffff',
+          fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+        },
+      });
+      try {
+        const result = await mermaid.render(renderId, block.code);
+        if (cancelled || !containerRef.current) return;
+        containerRef.current.innerHTML = result.svg;
+        result.bindFunctions?.(containerRef.current);
+      } catch {
+        if (!cancelled) setError(true);
+      }
+    }).catch(() => {
+      if (!cancelled) setError(true);
+    });
+    return () => { cancelled = true; };
+  }, [block.code, renderId]);
+
+  return (
+    <figure className="lesson-rich-block lesson-rich-block--mermaid">
+      {error ? <pre className="lesson-rich-block__fallback"><code><HighlightedCode code={block.code} language="text" /></code></pre> : <div aria-label={block.caption ?? 'Lesson diagram'} ref={containerRef} />}
+      {block.caption && <figcaption>{block.caption}</figcaption>}
+    </figure>
+  );
+}
+
+function ArticleBlock({ block, sources }: { block: LessonArticleBlock; sources: LessonMaterial['sources'] }) {
+  switch (block.type) {
+    case 'paragraph':
+      return <p><CitationText sources={sources} text={block.text} /></p>;
+    case 'code':
+      return <CodeBlock code={block.code} language={block.language} caption={block.caption} />;
+    case 'equation':
+      return <EquationBlock block={block} />;
+    case 'mermaid':
+      return <MermaidBlock block={block} />;
+    case 'table':
+      return (
+        <figure className="lesson-rich-block lesson-rich-block--table">
+          <div className="lesson-rich-block__table-wrap">
+            <table>
+              <thead><tr>{block.columns.map((column) => <th key={column} scope="col">{column}</th>)}</tr></thead>
+              <tbody>{block.rows.map((row, rowIndex) => <tr key={`${row[0]}-${rowIndex}`}>{row.map((cell, cellIndex) => cellIndex === 0
+                ? <th key={`${cell}-${cellIndex}`} scope="row"><CitationText sources={sources} text={cell} /></th>
+                : <td key={`${cell}-${cellIndex}`}><CitationText sources={sources} text={cell} /></td>)}</tr>)}</tbody>
+            </table>
+          </div>
+          {block.caption && <figcaption>{block.caption}</figcaption>}
+        </figure>
+      );
+    case 'quote':
+      return (
+        <blockquote className="lesson-rich-block lesson-rich-block--quote">
+          <p><CitationText sources={sources} text={block.text} /></p>
+          {block.attribution && <cite><CitationText sources={sources} text={block.attribution} /></cite>}
+          {block.sourceId && <CitationText sources={sources} text={`[[${block.sourceId}]]`} />}
+        </blockquote>
+      );
+  }
+}
+
+function ArticleBody({ article, sources }: Pick<LessonMaterial, 'article' | 'sources'>) {
   return (
     <div className="lesson-reading">
       {article.sections.map((section) => (
         <section className="lesson-reading__section" key={section.heading}>
           <h2>{section.heading}</h2>
-          {section.paragraphs.map((paragraph, index) => <p key={`${section.heading}-${index}`}>{renderParagraph(paragraph)}</p>)}
+          {section.content.length > 0
+            ? section.content.map((block, index) => <ArticleBlock block={block} key={`${section.heading}-${block.type}-${index}`} sources={sources} />)
+            : section.paragraphs.map((paragraph, index) => <p key={`${section.heading}-${index}`}><CitationText sources={sources} text={paragraph} /></p>)}
         </section>
       ))}
     </div>
@@ -221,80 +257,47 @@ function LessonReferences({ sources }: { sources: LessonMaterial['sources'] }) {
   );
 }
 
-function LessonNodeRenderer({ node, index }: { node: LessonNode; index: number }) {
-  if (node.type === 'prose') {
-    return (
-      <section className="lesson-block lesson-node lesson-node--prose" key={`${node.type}-${node.heading}-${index}`}>
-        <div>
-          <h2>{node.heading}</h2>
-          <p>{node.body}</p>
-          {node.bullets.length > 0 && <ul>{node.bullets.map((bullet) => <li key={bullet}>{bullet}</li>)}</ul>}
-        </div>
-      </section>
-    );
+function legacyNodeText(node: LessonNode) {
+  switch (node.type) {
+    case 'prose': return { paragraphs: [node.body], bullets: node.bullets };
+    case 'example': return { paragraphs: [node.context, node.insight], bullets: node.steps };
+    case 'comparison': return { paragraphs: [node.rows.map((row) => `${row.criterion}: ${row.left}; ${row.right}.`).join(' ')] };
+    case 'scenario': return { paragraphs: [node.situation, node.prompt, node.reasoning], bullets: node.choices };
+    case 'flow': return { paragraphs: [node.sequence.map((step) => `${step.label}: ${step.description}`).join(' '), node.outcome] };
+    case 'timeline': return { paragraphs: [node.events.map((event) => `${event.label}: ${event.description}`).join(' ')] };
+    case 'code': return { paragraphs: [node.explanation], bullets: node.bullets, code: node.code, language: node.language };
   }
+}
 
-  if (node.type === 'example') {
+function LegacyLessonBody({ blocks, nodes }: Pick<LessonMaterial, 'blocks' | 'nodes'>) {
+  if (blocks.length > 0) {
     return (
-      <section className="lesson-node lesson-node--example" key={`${node.type}-${node.heading}-${index}`}>
-        <h2>{node.heading}</h2>
-        <p className="lesson-node__context">{node.context}</p>
-        <ol className="lesson-node__steps">{node.steps.map((step) => <li key={step}>{step}</li>)}</ol>
-        <p className="lesson-node__insight">{node.insight}</p>
-      </section>
-    );
-  }
-
-  if (node.type === 'comparison') {
-    return (
-      <section className="lesson-node lesson-node--comparison" key={`${node.type}-${node.heading}-${index}`}>
-        <h2>{node.heading}</h2>
-        <div className="lesson-node__table-wrap"><table>
-          <thead><tr><th scope="col">Criterion</th><th scope="col">{node.leftLabel}</th><th scope="col">{node.rightLabel}</th></tr></thead>
-          <tbody>{node.rows.map((row) => <tr key={row.criterion}><th scope="row">{row.criterion}</th><td>{row.left}</td><td>{row.right}</td></tr>)}</tbody>
-        </table></div>
-      </section>
-    );
-  }
-
-  if (node.type === 'scenario') {
-    return (
-      <section className="lesson-node lesson-node--scenario" key={`${node.type}-${node.heading}-${index}`}>
-        <h2>{node.heading}</h2>
-        <p>{node.situation}</p>
-        <p className="lesson-node__prompt">{node.prompt}</p>
-        <ol className="lesson-node__choices">{node.choices.map((choice) => <li key={choice}>{choice}</li>)}</ol>
-        <details className="lesson-node__reveal"><summary>See the reasoning</summary><p>{node.reasoning}</p></details>
-      </section>
-    );
-  }
-
-  if (node.type === 'flow') {
-    return (
-      <section className="lesson-node lesson-node--flow" key={`${node.type}-${node.heading}-${index}`}>
-        <h2>{node.heading}</h2>
-        <ol className="lesson-node__flow">{node.sequence.map((step, stepIndex) => <li key={`${step.label}-${stepIndex}`}><span>{String(stepIndex + 1).padStart(2, '0')}</span><div><strong>{step.label}</strong><p>{step.description}</p></div></li>)}</ol>
-        <p className="lesson-node__outcome">{node.outcome}</p>
-      </section>
-    );
-  }
-
-  if (node.type === 'timeline') {
-    return (
-      <section className="lesson-node lesson-node--timeline" key={`${node.type}-${node.heading}-${index}`}>
-        <h2>{node.heading}</h2>
-        <ol className="lesson-node__timeline">{node.events.map((event) => <li key={event.label}><strong>{event.label}</strong><p>{event.description}</p></li>)}</ol>
-      </section>
+      <div className="lesson-reading lesson-reading--legacy">
+        {blocks.map((block) => (
+          <section className="lesson-reading__section" key={block.heading}>
+            <h2>{block.heading}</h2>
+            <p>{block.body}</p>
+            {block.bullets.length > 0 && <ul>{block.bullets.map((bullet) => <li key={bullet}>{bullet}</li>)}</ul>}
+          </section>
+        ))}
+      </div>
     );
   }
 
   return (
-    <section className="lesson-node lesson-node--code" key={`${node.type}-${node.heading}-${index}`}>
-      <h2>{node.heading}</h2>
-      <pre><code>{node.code}</code></pre>
-      <p>{node.explanation}</p>
-      {node.bullets.length > 0 && <ul>{node.bullets.map((bullet) => <li key={bullet}>{bullet}</li>)}</ul>}
-    </section>
+    <div className="lesson-reading lesson-reading--legacy">
+      {nodes.map((node) => {
+        const content = legacyNodeText(node);
+        return (
+          <section className="lesson-reading__section" key={`${node.type}-${node.heading}`}>
+            <h2>{node.heading}</h2>
+            {content.paragraphs.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+            {content.bullets && content.bullets.length > 0 && <ul>{content.bullets.map((bullet) => <li key={bullet}>{bullet}</li>)}</ul>}
+            {content.code && <CodeBlock code={content.code} language={content.language ?? 'text'} />}
+          </section>
+        );
+      })}
+    </div>
   );
 }
 
@@ -309,22 +312,8 @@ function LessonContent({
   onComplete: () => void;
   onQuiz: () => void;
 }) {
-  const { lesson, section } = item;
+  const { lesson } = item;
   const material = lesson.material;
-  const [practiceDraft, setPracticeDraft] = useState('');
-  const [practiceSaved, setPracticeSaved] = useState(false);
-
-  useEffect(() => {
-    if (!material?.practice) return;
-    setPracticeDraft(window.localStorage.getItem(`synau.practice.${lesson.id}`) ?? '');
-    setPracticeSaved(false);
-  }, [lesson.id, material?.practice]);
-
-  function savePracticeDraft() {
-    window.localStorage.setItem(`synau.practice.${lesson.id}`, practiceDraft);
-    setPracticeSaved(true);
-    window.setTimeout(() => setPracticeSaved(false), 2200);
-  }
 
   if (!material) return null;
 
@@ -334,71 +323,14 @@ function LessonContent({
         <p>{material.overview}</p>
       </div>
 
-      {material.article.sections.length > 0 ? <ArticleBody article={material.article} sources={material.sources} /> : (
-        <div className="lesson-blocks">
-          {material.nodes.length > 0
-            ? material.nodes.map((node, index) => <LessonNodeRenderer index={index} key={`${node.type}-${index}`} node={node} />)
-            : material.blocks.map((block, index) => (
-              <section className="lesson-block" key={`${block.heading}-${index}`}>
-                <span className="lesson-block__index">{String(index + 1).padStart(2, '0')}</span>
-                <div>
-                  <h2>{block.heading}</h2>
-                  <p>{block.body}</p>
-                  {block.bullets.length > 0 && <ul>{block.bullets.map((bullet) => <li key={bullet}>{bullet}</li>)}</ul>}
-                </div>
-              </section>
-            ))}
-        </div>
-      )}
+      {material.article.sections.length > 0
+        ? <ArticleBody article={material.article} sources={material.sources} />
+        : <LegacyLessonBody blocks={material.blocks} nodes={material.nodes} />}
 
-      {material.article.sections.length > 0 && material.nodes.length > 0 && (
-        <section className="lesson-components" aria-label="Supporting lesson material">
-          <div className="lesson-components__list">
-            {material.nodes.map((node, index) => <LessonNodeRenderer index={index} key={`${node.type}-${index}`} node={node} />)}
-          </div>
-        </section>
-      )}
-
-      {material.dataLab && <DataLab dataLab={material.dataLab} key={lesson.id} />}
-
-      <aside className="takeaway-card">
+      <aside className="lesson-takeaway">
         <span>Key takeaway</span>
         <p>{material.keyTakeaway}</p>
       </aside>
-
-      <section className="reflection-card" aria-label="Reflection prompt">
-        <p className="reflection-card__prompt">{material.reflectivePrompt}</p>
-      </section>
-
-      {material.practice && (
-        <section className="practice-studio" aria-label="Optional practice">
-          <p className="practice-studio__prompt">{material.practice.prompt}</p>
-          <div className="practice-studio__grid">
-            <div>
-              <ol>
-                {material.practice.steps.map((step) => <li key={step}>{step}</li>)}
-              </ol>
-            </div>
-            <div>
-              <ul>
-                {material.practice.rubric.map((criterion) => <li key={criterion}>{criterion}</li>)}
-              </ul>
-            </div>
-          </div>
-          <div className="practice-studio__draft">
-            <textarea aria-label="Practice draft" onChange={(event) => { setPracticeDraft(event.target.value); setPracticeSaved(false); }} placeholder="Write a first pass here. It stays in this browser." rows={5} value={practiceDraft} />
-          </div>
-          <div className="practice-studio__footer">
-            {practiceSaved && <small>Draft saved locally in this browser.</small>}
-            <button className="button button--secondary" onClick={savePracticeDraft} type="button">Save draft</button>
-          </div>
-        </section>
-      )}
-
-      <div className="lesson-source-note">
-        <strong>About this material</strong>
-        <p>{material.sourceNote}</p>
-      </div>
 
       <LessonReferences sources={material.sources} />
 
@@ -434,6 +366,8 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
   const [completionError, setCompletionError] = useState('');
   const [quizLaunch, setQuizLaunch] = useState<QuizLaunch | null>(null);
   const lessonTopRef = useRef<HTMLDivElement>(null);
+  const quizLaunchKeyRef = useRef<string | null>(null);
+  const completionInFlightRef = useRef(false);
 
   const openLesson = useCallback(async (lessonId: string) => {
     const activeLessonId = activeLessonGenerationRef.current;
@@ -499,7 +433,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
   const selectedIndex = lessons.findIndex(({ lesson }) => lesson.id === selectedLessonId);
   const selectedItem = selectedIndex >= 0 ? lessons[selectedIndex] : null;
 
-  function selectLesson(lessonId: string) {
+  const selectLesson = useCallback((lessonId: string) => {
     setSelectedLessonId(lessonId);
     setCompletionError('');
     const item = lessons.find(({ lesson }) => lesson.id === lessonId);
@@ -509,10 +443,11 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
     if (window.innerWidth < 900) {
       window.setTimeout(() => lessonTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 20);
     }
-  }
+  }, [lessons, openingLessons, openLesson]);
 
-  async function completeSelectedLesson() {
-    if (!selectedItem || selectedItem.lesson.completedAt) return;
+  const completeSelectedLesson = useCallback(async () => {
+    if (!selectedItem || selectedItem.lesson.completedAt || completionInFlightRef.current) return;
+    completionInFlightRef.current = true;
     setCompletingLessonId(selectedItem.lesson.id);
     setCompletionError('');
     try {
@@ -521,15 +456,24 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
     } catch (error) {
       setCompletionError(error instanceof Error ? error.message : 'Could not save your progress.');
     } finally {
+      completionInFlightRef.current = false;
       setCompletingLessonId('');
     }
-  }
+  }, [courseId, selectedItem]);
 
-  function launchQuiz(scope: QuizScope, scopeId: string, scopeTitle: string) {
+  const launchQuiz = useCallback((scope: QuizScope, scopeId: string, scopeTitle: string) => {
     if (!course) return;
+    const key = `${scope}:${scopeId}`;
+    if (quizLaunchKeyRef.current === key) return;
+    quizLaunchKeyRef.current = key;
     const initialRequest = api.generateQuiz({ course, scope, scopeId, scopeTitle });
     setQuizLaunch({ initialRequest, scope, scopeId, scopeTitle });
-  }
+  }, [course]);
+
+  const closeQuiz = useCallback(() => {
+    quizLaunchKeyRef.current = null;
+    setQuizLaunch(null);
+  }, []);
 
   if (loading) {
     return (
@@ -557,6 +501,10 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
 
   const selectedLesson = selectedItem?.lesson;
   const selectedSection = selectedItem?.section;
+  const selectedSectionIndex = selectedSection
+    ? course.sections.findIndex((section) => section.id === selectedSection.id)
+    : -1;
+  const selectedSectionNumber = selectedSectionIndex >= 0 ? selectedSectionIndex + 1 : 1;
   const lessonOpening = selectedLesson ? openingLessons.has(selectedLesson.id) : false;
   const lessonError = selectedLesson ? lessonErrors[selectedLesson.id] : '';
   const lessonIsBusy = selectedLesson ? Boolean(lessonGenerationBusy[selectedLesson.id]) : false;
@@ -589,7 +537,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
             <>
               <header className="lesson-header">
                 <div className="lesson-header__meta">
-                  <span>Section {selectedSection.position + 1}</span>
+                  <span>Section {selectedSectionNumber}</span>
                   <i />
                   <span>{selectedSection.title}</span>
                   <i />
@@ -669,9 +617,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
         </main>
       </div>
 
-      {quizLaunch && (
-        <QuizPanel course={course} launch={quizLaunch} onClose={() => setQuizLaunch(null)} />
-      )}
+      {quizLaunch && <QuizPanel course={course} launch={quizLaunch} onClose={closeQuiz} />}
     </div>
   );
 }

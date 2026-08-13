@@ -157,6 +157,26 @@ create table if not exists public.credit_topups (
 );
 create index if not exists credit_topups_user_created_idx on public.credit_topups (user_id, created_at desc);
 
+create table if not exists public.credit_promo_codes (
+  id text primary key,
+  token text not null unique,
+  credits integer not null check (credits > 0),
+  active boolean not null default true,
+  max_redemptions integer not null default 1 check (max_redemptions > 0),
+  redeemed_count integer not null default 0 check (redeemed_count >= 0),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.credit_promo_redemptions (
+  id text primary key,
+  promo_code_id text not null references public.credit_promo_codes(id) on delete cascade,
+  user_id text not null references public.users(id) on delete cascade,
+  credits integer not null check (credits > 0),
+  created_at timestamptz not null default now(),
+  unique (promo_code_id, user_id)
+);
+create index if not exists credit_promo_redemptions_user_created_idx on public.credit_promo_redemptions (user_id, created_at desc);
+
 create table if not exists public.auth_challenges (
   id text primary key,
   mode text not null check (mode in ('sign_in', 'sign_up')),

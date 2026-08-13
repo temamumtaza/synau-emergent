@@ -95,6 +95,7 @@ if (!supabaseStorage) db.exec(`
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     topic TEXT NOT NULL,
+    language TEXT NOT NULL DEFAULT 'en' CHECK (language IN ('en', 'id')),
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     outcomes_json TEXT NOT NULL,
@@ -197,6 +198,23 @@ if (!supabaseStorage) db.exec(`
     updated_at TEXT NOT NULL,
     settled_at TEXT
   );
+  CREATE TABLE IF NOT EXISTS credit_promo_codes (
+    id TEXT PRIMARY KEY,
+    token TEXT NOT NULL UNIQUE,
+    credits INTEGER NOT NULL CHECK (credits > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    max_redemptions INTEGER NOT NULL DEFAULT 1 CHECK (max_redemptions > 0),
+    redeemed_count INTEGER NOT NULL DEFAULT 0 CHECK (redeemed_count >= 0),
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS credit_promo_redemptions (
+    id TEXT PRIMARY KEY,
+    promo_code_id TEXT NOT NULL REFERENCES credit_promo_codes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    credits INTEGER NOT NULL CHECK (credits > 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (promo_code_id, user_id)
+  );
   CREATE TABLE IF NOT EXISTS auth_challenges (
     id TEXT PRIMARY KEY,
     mode TEXT NOT NULL,
@@ -215,9 +233,11 @@ if (!supabaseStorage) db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sections_course ON course_sections(course_id, position);
   CREATE INDEX IF NOT EXISTS idx_lessons_section ON lessons(section_id, position);
   CREATE INDEX IF NOT EXISTS idx_events_course ON progress_events(course_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_events_user_course ON progress_events(user_id, course_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_credit_ledger_user ON credit_ledger(user_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_llm_usage_user ON llm_usage(user_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_credit_topups_user ON credit_topups(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_credit_promo_redemptions_user ON credit_promo_redemptions(user_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_auth_challenges_identifier ON auth_challenges(mode, identifier, created_at DESC);
 `);
 
@@ -229,6 +249,9 @@ if (!supabaseStorage) {
   if (!userColumns.has('first_name')) db.exec("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''");
   if (!userColumns.has('last_name')) db.exec("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''");
   if (!userColumns.has('username')) db.exec("ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''");
+
+  const courseColumns = new Set((db.prepare('PRAGMA table_info(courses)').all() as Array<{ name: string }>).map((column) => column.name));
+  if (!courseColumns.has('language')) db.exec("ALTER TABLE courses ADD COLUMN language TEXT NOT NULL DEFAULT 'en'");
 
   const normalizeLegacyUsername = (value: string) => value.toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 32);
   const existingUsers = db.prepare('SELECT id, email, name, first_name, last_name, username FROM users ORDER BY created_at, id').all() as Array<{

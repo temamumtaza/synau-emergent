@@ -78,9 +78,13 @@ export const AuthCodeResponseSchema = z.object({
 });
 export type AuthCodeResponse = z.infer<typeof AuthCodeResponseSchema>;
 
+export const CourseLanguageSchema = z.enum(['en', 'id']);
+export type CourseLanguage = z.infer<typeof CourseLanguageSchema>;
+
 export const TopicInputSchema = z.object({
   topic: z.string().trim().min(3).max(120),
-});
+  language: CourseLanguageSchema.default('en'),
+}).strict();
 
 export const RoadmapLessonSchema = z.object({
   id: EntityIdSchema,
@@ -104,6 +108,7 @@ export const RoadmapSchema = z.object({
   title: z.string().min(1).max(160),
   description: z.string().min(1).max(500),
   topic: z.string().min(3).max(120),
+  language: CourseLanguageSchema.default('en'),
   outcomes: z.array(z.string().min(1).max(180)).min(3).max(6),
   sections: z.array(RoadmapSectionSchema).min(2).max(8),
 });
@@ -113,6 +118,7 @@ export const LessonGenerationInputSchema = z.object({
   courseId: EntityIdSchema,
   lessonId: EntityIdSchema,
   topic: z.string(),
+  language: CourseLanguageSchema.default('en'),
   courseTitle: z.string(),
   sectionTitle: z.string(),
   lessonTitle: z.string(),
@@ -194,10 +200,77 @@ export type LessonNode = z.infer<typeof LessonNodeSchema>;
 export const LESSON_NODE_TYPES = ['prose', 'example', 'comparison', 'scenario', 'flow', 'timeline', 'code'] as const;
 export type LessonNodeType = typeof LESSON_NODE_TYPES[number];
 
+const LessonArticleParagraphBlockSchema = z.object({
+  type: z.literal('paragraph'),
+  text: z.string().trim().min(40).max(1400),
+}).strict();
+
+const LessonArticleCodeBlockSchema = z.object({
+  type: z.literal('code'),
+  language: z.string().trim().min(1).max(40),
+  code: z.string().min(1).max(2400),
+  caption: z.string().trim().min(1).max(240).optional(),
+}).strict();
+
+const LessonArticleEquationBlockSchema = z.object({
+  type: z.literal('equation'),
+  latex: z.string().trim().min(1).max(800),
+  caption: z.string().trim().min(1).max(240).optional(),
+}).strict();
+
+const LessonArticleMermaidBlockSchema = z.object({
+  type: z.literal('mermaid'),
+  code: z.string().trim().min(1).max(3000),
+  caption: z.string().trim().min(1).max(240).optional(),
+}).strict();
+
+const LessonArticleTableRowSchema = z.array(z.string().trim().min(1).max(240)).min(2).max(6);
+const LessonArticleTableBlockSchema = z.object({
+  type: z.literal('table'),
+  caption: z.string().trim().min(1).max(240).optional(),
+  columns: z.array(z.string().trim().min(1).max(100)).min(2).max(6),
+  rows: z.array(LessonArticleTableRowSchema).min(2).max(8),
+}).strict().superRefine((table, ctx) => {
+  for (const [index, row] of table.rows.entries()) {
+    if (row.length !== table.columns.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['rows', index],
+        message: 'Every article table row must match the number of columns.',
+      });
+    }
+  }
+});
+
+const LessonArticleQuoteBlockSchema = z.object({
+  type: z.literal('quote'),
+  text: z.string().trim().min(20).max(800),
+  attribution: z.string().trim().min(1).max(180).optional(),
+  sourceId: EntityIdSchema.optional(),
+}).strict();
+
+export const LessonArticleBlockSchema = z.discriminatedUnion('type', [
+  LessonArticleParagraphBlockSchema,
+  LessonArticleCodeBlockSchema,
+  LessonArticleEquationBlockSchema,
+  LessonArticleMermaidBlockSchema,
+  LessonArticleTableBlockSchema,
+  LessonArticleQuoteBlockSchema,
+]);
+export type LessonArticleBlock = z.infer<typeof LessonArticleBlockSchema>;
+
 export const LessonArticleSectionSchema = z.object({
   heading: z.string().trim().min(1).max(140),
-  paragraphs: z.array(z.string().trim().min(40).max(1400)).min(1).max(3),
-}).strict();
+  // `paragraphs` is the compatibility shape used by earlier article lessons.
+  paragraphs: z.array(z.string().trim().min(40).max(1400)).max(3).default([]),
+  // New lessons use an ordered article stream so optional formats stay inside
+  // the reading instead of becoming detached cards.
+  content: z.array(LessonArticleBlockSchema).max(10).default([]),
+}).strict().superRefine((section, ctx) => {
+  if (section.paragraphs.length === 0 && section.content.length === 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['content'], message: 'An article section needs readable content.' });
+  }
+});
 
 export const LessonArticleSchema = z.object({
   sections: z.array(LessonArticleSectionSchema).max(5).default([]),
@@ -254,15 +327,15 @@ export const LessonMaterialSchema = z.object({
   lessonId: EntityIdSchema,
   title: z.string().min(1).max(160),
   overview: z.string().min(1).max(600),
-  // `blocks` is retained for already-generated courses. New provider output uses
-  // the renderer-backed `nodes` collection below.
+  // Legacy fields are retained for already-generated courses. New provider
+  // output is article-first; these fields are compatibility-only.
   blocks: z.array(LessonBlockSchema).max(6).default([]),
   nodes: z.array(LessonNodeSchema).max(5).default([]),
   article: LessonArticleSchema.default({ sections: [] }),
   sources: z.array(LessonSourceSchema).max(6).default([]),
   keyTakeaway: z.string().min(1).max(280),
-  reflectivePrompt: z.string().min(1).max(280),
-  sourceNote: z.string().min(1).max(280),
+  reflectivePrompt: z.string().min(1).max(280).optional(),
+  sourceNote: z.string().min(1).max(280).optional(),
   practice: LessonPracticeSchema.optional(),
   dataLab: LessonDataLabSchema.optional(),
 }).superRefine((lesson, ctx) => {
@@ -286,6 +359,17 @@ export const LessonMaterialSchema = z.object({
         }
       }
     }
+    for (const [blockIndex, block] of section.content.entries()) {
+      for (const match of lessonArticleBlockContext(block).matchAll(/\[\[([^\]]+)\]\]/g)) {
+        citedSourceIds.add(match[1]);
+        if (!sourceIds.has(match[1])) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', sectionIndex, 'content', blockIndex], message: `Citation ${match[1]} does not reference a lesson source.` });
+        }
+      }
+      if (block.type === 'quote' && block.sourceId && !sourceIds.has(block.sourceId)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', sectionIndex, 'content', blockIndex, 'sourceId'], message: `Quote source ${block.sourceId} does not reference a lesson source.` });
+      }
+    }
   }
 });
 export type LessonMaterial = z.infer<typeof LessonMaterialSchema>;
@@ -302,9 +386,23 @@ export function lessonNodeContext(node: LessonNode): string {
   }
 }
 
+export function lessonArticleBlockContext(block: LessonArticleBlock): string {
+  switch (block.type) {
+    case 'paragraph': return block.text;
+    case 'code': return `${block.caption ?? 'Code example'}: ${block.code}`;
+    case 'equation': return `${block.caption ?? 'Equation'}: ${block.latex}`;
+    case 'mermaid': return `${block.caption ?? 'Diagram'}: ${block.code}`;
+    case 'table': return `${block.caption ?? 'Table'}: ${block.columns.join(' / ')} ${block.rows.map((row) => row.join(' / ')).join(' ')}`;
+    case 'quote': return `${block.text} ${block.attribution ?? ''}`.trim();
+  }
+}
+
 export function lessonMaterialContext(material: Pick<LessonMaterial, 'nodes' | 'blocks' | 'article'>): string[] {
   return [
-    ...material.article.sections.flatMap((section) => section.paragraphs.map((paragraph) => `${section.heading}: ${paragraph}`)),
+    ...material.article.sections.flatMap((section) => [
+      ...section.paragraphs.map((paragraph) => `${section.heading}: ${paragraph}`),
+      ...section.content.map((block) => `${section.heading}: ${lessonArticleBlockContext(block)}`),
+    ]),
     ...material.nodes.map(lessonNodeContext),
     ...material.blocks.map((block) => `${block.heading}: ${block.body}`),
   ];
@@ -319,6 +417,7 @@ export const QuizGenerationInputSchema = z.object({
   scopeId: EntityIdSchema,
   courseTitle: z.string(),
   topic: z.string(),
+  language: CourseLanguageSchema.default('en'),
   scopeTitle: z.string(),
   materialContext: z.array(z.string()).max(80),
   courseMemory: z.array(z.string()).max(40),
@@ -331,6 +430,8 @@ export const QuizRequestSchema = z.object({
   scopeId: EntityIdSchema,
 });
 export type QuizRequest = z.infer<typeof QuizRequestSchema>;
+
+const QuizQuestionKindSchema = z.enum(['article', 'challenge']);
 
 const QuizQuestionBaseSchema = z.object({
   id: EntityIdSchema,
@@ -347,6 +448,9 @@ const QuizQuestionBaseSchema = z.object({
   }),
   answerIndex: z.number().int().min(0).max(4),
   explanation: z.string().min(1).max(500),
+  // Optional for compatibility with quizzes generated before the grounded
+  // three-question contract.
+  kind: QuizQuestionKindSchema.optional(),
 });
 
 export const QuizQuestionSchema = QuizQuestionBaseSchema.superRefine((question, ctx) => {
@@ -367,6 +471,27 @@ const QuizQuestionsSchema = z.array(QuizQuestionSchema).min(2).max(8).superRefin
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: [], message: 'Quiz answer positions must vary across questions.' });
   }
 });
+
+const GeneratedQuizQuestionSchema = QuizQuestionBaseSchema.extend({
+  kind: QuizQuestionKindSchema,
+  articleAnchor: z.string().trim().min(8).max(180),
+}).strict();
+
+export const GeneratedQuizSchema = z.object({
+  id: EntityIdSchema,
+  scope: QuizScopeSchema,
+  scopeId: EntityIdSchema,
+  title: z.string().min(1).max(180),
+  instructions: z.string().min(1).max(400),
+  questions: z.array(GeneratedQuizQuestionSchema).length(3),
+}).strict().superRefine((quiz, ctx) => {
+  const articleCount = quiz.questions.filter((question) => question.kind === 'article').length;
+  const challengeCount = quiz.questions.filter((question) => question.kind === 'challenge').length;
+  if (articleCount !== 2 || challengeCount !== 1) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['questions'], message: 'A generated quiz must contain exactly two article questions and one challenge question.' });
+  }
+});
+export type GeneratedQuiz = z.infer<typeof GeneratedQuizSchema>;
 
 export const QuizSchema = z.object({
   id: EntityIdSchema,
@@ -440,6 +565,7 @@ export type CourseSection = z.infer<typeof CourseSectionSchema>;
 export const CourseSchema = z.object({
   id: EntityIdSchema,
   topic: z.string(),
+  language: CourseLanguageSchema.default('en'),
   title: z.string(),
   description: z.string(),
   outcomes: z.array(z.string()),
@@ -505,6 +631,18 @@ export const CreditSummarySchema = z.object({
   recentTransactions: z.array(CreditTransactionSchema).max(20),
 }).strict();
 export type CreditSummary = z.infer<typeof CreditSummarySchema>;
+
+export const RedeemCreditInputSchema = z.object({
+  token: z.string().trim().min(8).max(80),
+}).strict();
+export type RedeemCreditInput = z.infer<typeof RedeemCreditInputSchema>;
+
+export const RedeemCreditResponseSchema = z.object({
+  creditsAdded: z.number().int().nonnegative(),
+  alreadyRedeemed: z.boolean(),
+  balance: z.number().int().nonnegative(),
+}).strict();
+export type RedeemCreditResponse = z.infer<typeof RedeemCreditResponseSchema>;
 
 export const CreateTopUpInputSchema = z.object({
   productId: EntityIdSchema,

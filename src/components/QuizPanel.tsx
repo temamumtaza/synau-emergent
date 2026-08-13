@@ -173,7 +173,7 @@ export function QuizPanel({ course, launch, onClose }: QuizPanelProps) {
                       key={question.id}
                     >
                       <legend>
-                        <span>Question {questionIndex + 1} of {quiz.questions.length}</span>
+                        <span>Question {questionIndex + 1} of {quiz.questions.length}{question.kind ? ` · ${question.kind === 'challenge' ? 'Challenge' : 'From the article'}` : ''}</span>
                         <strong>{question.prompt}</strong>
                       </legend>
                       <div className="quiz-options">

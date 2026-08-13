@@ -6,17 +6,20 @@ import { generatorTools } from '../shared/generators.js';
 import {
   LessonGenerationInputSchema,
   LessonMaterialSchema,
-  LESSON_NODE_TYPES,
+  GeneratedQuizSchema,
   type LessonGenerationInput,
   type LessonArticle,
   type LessonNode,
+  type GeneratedQuiz,
   QuizGenerationInputSchema,
   QuizSchema,
   RoadmapSchema,
   TopicInputSchema,
+  lessonArticleBlockContext,
   type LessonMaterial,
   type Quiz,
   type QuizGenerationInput,
+  type CourseLanguage,
   type Roadmap,
 } from '../shared/schemas.js';
 
@@ -91,6 +94,7 @@ const toolParameters: Record<keyof typeof generatorTools, ToolParameterSchema> =
       title: { type: 'string' },
       description: { type: 'string' },
       topic: { type: 'string' },
+      language: { type: 'string', enum: ['en', 'id'] },
       outcomes: stringArray,
       sections: {
         type: 'array',
@@ -128,7 +132,7 @@ const toolParameters: Record<keyof typeof generatorTools, ToolParameterSchema> =
   lesson: {
     type: 'object',
     additionalProperties: false,
-    required: ['lessonId', 'title', 'overview', 'article', 'sources', 'keyTakeaway', 'reflectivePrompt', 'sourceNote'],
+    required: ['lessonId', 'title', 'overview', 'article', 'sources', 'keyTakeaway'],
     properties: {
       lessonId: { type: 'string' },
       title: { type: 'string' },
@@ -142,10 +146,31 @@ const toolParameters: Record<keyof typeof generatorTools, ToolParameterSchema> =
             type: 'array', minItems: 2, maxItems: 5,
             items: {
               type: 'object', additionalProperties: false,
-              required: ['heading', 'paragraphs'],
+              required: ['heading', 'content'],
               properties: {
                 heading: { type: 'string' },
-                paragraphs: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string' } },
+                content: {
+                  type: 'array', minItems: 2, maxItems: 10,
+                  items: {
+                    type: 'object', additionalProperties: false,
+                    required: ['type'],
+                    properties: {
+                      type: { type: 'string', enum: ['paragraph', 'code', 'equation', 'mermaid', 'table', 'quote'] },
+                      text: { type: 'string' },
+                      language: { type: 'string' },
+                      code: { type: 'string' },
+                      latex: { type: 'string' },
+                      caption: { type: 'string' },
+                      attribution: { type: 'string' },
+                      sourceId: { type: 'string' },
+                      columns: { type: 'array', minItems: 2, maxItems: 6, items: { type: 'string' } },
+                      rows: {
+                        type: 'array', minItems: 2, maxItems: 8,
+                        items: { type: 'array', minItems: 2, maxItems: 6, items: { type: 'string' } },
+                      },
+                    },
+                  },
+                },
               },
             },
           },
@@ -165,61 +190,7 @@ const toolParameters: Record<keyof typeof generatorTools, ToolParameterSchema> =
           },
         },
       },
-      nodes: {
-        type: 'array',
-        maxItems: 3,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['type', 'heading'],
-          properties: {
-            type: { type: 'string', enum: [...LESSON_NODE_TYPES] },
-            heading: { type: 'string' },
-            body: { type: 'string' },
-            bullets: { type: 'array', maxItems: 6, items: { type: 'string' } },
-            context: { type: 'string' },
-            steps: { type: 'array', maxItems: 6, items: { type: 'string' } },
-            insight: { type: 'string' },
-            leftLabel: { type: 'string' },
-            rightLabel: { type: 'string' },
-            rows: {
-              type: 'array', maxItems: 6,
-              items: {
-                type: 'object', additionalProperties: false,
-                required: ['criterion', 'left', 'right'],
-                properties: { criterion: { type: 'string' }, left: { type: 'string' }, right: { type: 'string' } },
-              },
-            },
-            situation: { type: 'string' },
-            choices: { type: 'array', minItems: 2, maxItems: 4, items: { type: 'string' } },
-            prompt: { type: 'string' },
-            reasoning: { type: 'string' },
-            sequence: {
-              type: 'array', maxItems: 6,
-              items: {
-                type: 'object', additionalProperties: false,
-                required: ['label', 'description'],
-                properties: { label: { type: 'string' }, description: { type: 'string' } },
-              },
-            },
-            outcome: { type: 'string' },
-            events: {
-              type: 'array', minItems: 2, maxItems: 8,
-              items: {
-                type: 'object', additionalProperties: false,
-                required: ['label', 'description'],
-                properties: { label: { type: 'string' }, description: { type: 'string' } },
-              },
-            },
-            language: { type: 'string' },
-            code: { type: 'string' },
-            explanation: { type: 'string' },
-          },
-        },
-      },
       keyTakeaway: { type: 'string' },
-      reflectivePrompt: { type: 'string' },
-      sourceNote: { type: 'string' },
     },
   },
   quiz: {
@@ -234,18 +205,20 @@ const toolParameters: Record<keyof typeof generatorTools, ToolParameterSchema> =
       instructions: { type: 'string' },
       questions: {
         type: 'array',
-        minItems: 2,
-        maxItems: 8,
+        minItems: 3,
+        maxItems: 3,
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['id', 'prompt', 'options', 'answerIndex', 'explanation'],
+          required: ['id', 'prompt', 'options', 'answerIndex', 'explanation', 'kind', 'articleAnchor'],
           properties: {
             id: { type: 'string' },
             prompt: { type: 'string' },
-            options: { type: 'array', minItems: 3, maxItems: 5, uniqueItems: true, items: { type: 'string' } },
+            options: { type: 'array', minItems: 3, maxItems: 4, uniqueItems: true, items: { type: 'string', maxLength: 180 } },
             answerIndex: { type: 'integer', minimum: 0, maximum: 4 },
-            explanation: { type: 'string' },
+            explanation: { type: 'string', maxLength: 280 },
+            kind: { type: 'string', enum: ['article', 'challenge'] },
+            articleAnchor: { type: 'string', minLength: 8, maxLength: 180 },
           },
         },
       },
@@ -362,6 +335,77 @@ async function requestToolArguments(args: ToolRequestContext, requestBody: Recor
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeLessonArticleBlock(value: unknown) {
+  if (!isRecord(value)) return value;
+  const type = typeof value.type === 'string' ? value.type : '';
+  const text = typeof value.text === 'string' ? value.text : typeof value.body === 'string' ? value.body : undefined;
+  if (type === 'paragraph') {
+    return { type, text };
+  }
+  if (type === 'code') {
+    return {
+      type,
+      language: value.language,
+      code: typeof value.code === 'string' ? value.code : text,
+      ...(typeof value.caption === 'string' ? { caption: value.caption } : {}),
+    };
+  }
+  if (type === 'equation') {
+    return {
+      type,
+      latex: typeof value.latex === 'string' ? value.latex : text,
+      ...(typeof value.caption === 'string' ? { caption: value.caption } : {}),
+    };
+  }
+  if (type === 'mermaid') {
+    return {
+      type,
+      code: typeof value.code === 'string' ? value.code : text,
+      ...(typeof value.caption === 'string' ? { caption: value.caption } : {}),
+    };
+  }
+  if (type === 'table') {
+    return {
+      type,
+      ...(typeof value.caption === 'string' ? { caption: value.caption } : {}),
+      columns: value.columns,
+      rows: value.rows,
+    };
+  }
+  if (type === 'quote') {
+    return {
+      type,
+      text,
+      ...(typeof value.attribution === 'string' ? { attribution: value.attribution } : {}),
+      ...(typeof value.sourceId === 'string' ? { sourceId: value.sourceId } : {}),
+    };
+  }
+  return value;
+}
+
+function normalizeLessonToolArguments(value: unknown) {
+  if (!isRecord(value) || !isRecord(value.article) || !Array.isArray(value.article.sections)) return value;
+  return {
+    ...value,
+    article: {
+      ...value.article,
+      sections: value.article.sections.map((section) => {
+        if (!isRecord(section)) return section;
+        const heading = typeof section.heading === 'string' ? section.heading : section.title;
+        return {
+          heading,
+          ...(Array.isArray(section.paragraphs) ? { paragraphs: section.paragraphs } : {}),
+          content: Array.isArray(section.content) ? section.content.map(normalizeLessonArticleBlock) : section.content,
+        };
+      }),
+    },
+  };
+}
+
 async function callTool<T>(args: {
   key: keyof typeof generatorTools;
   schema: z.ZodType<T>;
@@ -374,6 +418,8 @@ async function callTool<T>(args: {
   if (useDemoProvider(args.settings)) {
     const localToolName = generatorTools[args.key].name;
     console.info(`[tool:${localToolName}] deterministic local invocation`);
+    const qaDelayMs = Math.min(5_000, Math.max(0, Number(process.env.SYNAU_QA_GENERATION_DELAY_MS ?? 0)));
+    if (qaDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, qaDelayMs));
     return args.schema.parse(args.fallback());
   }
   if (!args.settings.apiKey) {
@@ -421,22 +467,13 @@ async function callTool<T>(args: {
         repairRequestBody = addToolRepairMessage(repairRequestBody, args.key, message);
         continue;
       }
-      const parsed = args.schema.safeParse(toolArguments);
+      const normalizedToolArguments = args.key === 'lesson'
+        ? normalizeLessonToolArguments(toolArguments)
+        : toolArguments;
+      const parsed = args.schema.safeParse(normalizedToolArguments);
       if (parsed.success) {
         completed = true;
         return parsed.data;
-      }
-      // Supporting nodes are deliberately optional. If a provider returns a
-      // valid article but one visual node uses an unsupported shape, keep the
-      // article and discard only that optional surface instead of failing the
-      // whole lesson generation.
-      if (args.key === 'lesson' && toolArguments && typeof toolArguments === 'object' && 'nodes' in toolArguments) {
-        const articleOnly = args.schema.safeParse({ ...toolArguments, nodes: [] });
-        if (articleOnly.success) {
-          console.warn(`[tool:${generatorTools[args.key].name}] ignored invalid optional lesson nodes; article contract passed`);
-          completed = true;
-          return articleOnly.data;
-        }
       }
       const issues = parsed.error.issues.slice(0, 8).map((issue) => `${issue.path.join('.') || 'root'}: ${issue.message}`).join('; ');
       if (repairPass >= 2) {
@@ -454,9 +491,9 @@ async function callTool<T>(args: {
 
 function addToolRepairMessage(requestBody: Record<string, unknown>, key: keyof typeof generatorTools, issue: string) {
   const guidance = key === 'quiz'
-    ? 'For every question, answerIndex must be an integer from 0 through options.length - 1; use 3 to 5 unique options and vary correct answer positions.'
+    ? 'Return exactly 3 questions in order: exactly 2 with kind article and 1 with kind challenge. Article questions must be answerable directly from the supplied material context; the challenge must apply the same ideas to a new situation. Every question needs an articleAnchor of 8 to 180 characters, exactly 4 unique options under 180 characters, an explanation under 280 characters, and an answerIndex from 0 through options.length - 1.'
     : key === 'lesson'
-      ? 'Article must contain 2 to 5 sections with 1 to 3 natural paragraphs each. Every [[source-id]] marker must match a source id. Use at most 2 supporting nodes, match each node type, and omit unused fields. Do not return blocks, practice, or dataLab.'
+      ? 'Article must contain 2 to 5 sections with ordered content blocks, a two-sentence overview, and a distinct opening paragraph of at least 45 words. Use the learner\'s language and write with a natural editorial voice. If the material explains a process, sequence, causal chain, feedback loop, decision tree, system relationship, framework, or lifecycle, include one simple valid mermaid diagram immediately after the relevant explanation. Use code, equation, table, or quote only when it improves this lesson. Every [[source-id]] marker must match a source id. Omit legacy nodes, blocks, practice, dataLab, reflection, and source-note fields.'
       : 'Keep every lesson object complete with id, title, summary, estimatedMinutes, and position.';
   return {
     ...requestBody,
@@ -960,6 +997,7 @@ function decisionDataRoadmap(topic: string): Roadmap {
     title: decisionDataCurriculum.title,
     description: decisionDataCurriculum.description,
     topic,
+    language: 'en',
     outcomes: decisionDataCurriculum.outcomes,
     sections: decisionDataCurriculum.sections.map((section, sectionPosition) => ({
       id: `${key}-${section.id}`,
@@ -1059,13 +1097,52 @@ function fallbackLessonNodes(input: LessonGenerationInput, blocks: LessonMateria
 
 function fallbackLessonArticle(input: LessonGenerationInput, blocks: LessonMaterial['blocks']): LessonArticle {
   return {
-    sections: blocks.slice(0, 5).map((block) => ({
-      heading: block.heading,
-      paragraphs: [
-        block.body,
+    sections: blocks.slice(0, 5).map((block) => {
+      const openingBody = block.body.split(/\s+/).filter(Boolean).length < 45
+        ? `${block.body} That distinction gives you a concrete question to carry into the next conversation instead of another label to memorize.`
+        : block.body;
+      const paragraphs = [
+        openingBody,
         block.bullets.length > 0 ? `Keep these questions in view: ${block.bullets.join(' ')}` : 'Pause here and connect the idea to one situation in your own context.',
-      ],
-    })),
+      ];
+      return {
+        heading: block.heading,
+        paragraphs,
+        content: paragraphs.map((text) => ({ type: 'paragraph' as const, text })),
+      };
+    }),
+  };
+}
+
+function indonesianLesson(input: LessonGenerationInput): LessonMaterial {
+  const blocks = [
+    {
+      heading: 'Mulai dari pertanyaan yang tepat',
+      body: `${input.lessonSummary} Cara paling berguna untuk memahami ${input.lessonTitle.toLowerCase()} bukan dengan menghafal istilah, melainkan dengan melihat keputusan apa yang dibantu oleh konsep ini. Mulailah dari situasi nyata, batasan yang terlihat, dan hasil yang ingin kamu periksa.`,
+      bullets: ['Sebutkan masalah sebelum memilih metode.', 'Pisahkan fakta, asumsi, dan hal yang belum diketahui.', 'Tentukan sinyal yang akan kamu amati.'],
+    },
+    {
+      heading: 'Jadikan gagasannya terlihat',
+      body: `Ketika sebuah ide terasa abstrak, ubah ia menjadi langkah kecil yang bisa diamati. Dalam konteks ${input.topic}, kamu dapat mencoba satu perubahan, mencatat apa yang terjadi, lalu membandingkannya dengan tujuan awal. Dengan begitu, pemahaman tidak berhenti sebagai definisi, tetapi menjadi cara membaca situasi.`,
+      bullets: ['Pilih satu contoh yang cukup kecil untuk dicoba.', 'Tulis batasan yang dapat mengubah keputusan.', 'Periksa hasil sebelum menambah kompleksitas.'],
+    },
+    {
+      heading: 'Bawa ke situasi nyata',
+      body: `Gunakan subbab ini sebagai lensa untuk satu pekerjaan atau keputusan yang sedang kamu hadapi. Tidak perlu membuat rencana besar. Pilih langkah berikutnya yang paling kecil, jelaskan mengapa langkah itu masuk akal, dan tentukan bukti apa yang akan membuatmu mempertahankan atau mengubah pendekatan.`,
+      bullets: ['Apa tindakan berikutnya yang dapat diamati?', 'Kendala mana yang paling penting?', 'Apa yang akan membuatmu merevisi pendekatan?'],
+    },
+  ];
+  return {
+    lessonId: input.lessonId,
+    title: input.lessonTitle,
+    overview: `Subbab ini membantu kamu memahami ${input.lessonTitle.toLowerCase()} dalam konteks ${input.topic}. Kamu akan melihat cara mengubah gagasan tersebut menjadi langkah yang dapat diuji, bukan sekadar ringkasan untuk diingat.`,
+    article: fallbackLessonArticle(input, blocks),
+    nodes: [],
+    blocks,
+    keyTakeaway: `Pemahaman yang berguna tentang ${input.topic} terlihat dari cara kamu membingkai masalah, mengambil langkah kecil, membaca sinyal, dan memperbaiki langkah berikutnya.`,
+    reflectivePrompt: 'Di situasi mana kamu dapat memakai lensa ini dalam tujuh hari ke depan, dan bukti apa yang akan menunjukkan bahwa pendekatanmu membantu?',
+    sourceNote: 'Materi ini dibuat untuk kursus dan subbab yang sedang dibuka. Contoh bersifat ilustratif; sesuaikan dengan konteksmu sendiri.',
+    sources: [],
   };
 }
 
@@ -1091,7 +1168,56 @@ function decisionDataLesson(input: LessonGenerationInput): LessonMaterial {
   };
 }
 
-function fallbackRoadmap(topic: string): Roadmap {
+function indonesianFallbackRoadmap(topic: string): Roadmap {
+  const key = slug(topic);
+  return {
+    title: `${topic}: jalur belajar praktis`,
+    description: `Jalur terarah dari fondasi hingga penerapan ${topic}. Materi tiap subbab dibuat saat kamu membukanya agar tetap relevan dengan ritme belajar dan kebutuhanmu.`,
+    topic,
+    language: 'id',
+    outcomes: [
+      `Menjelaskan gagasan inti ${topic} dengan bahasa sederhana`,
+      `Menerapkan ${topic} pada masalah nyata dengan proses yang dapat diulang`,
+      `Menilai batasan dan menentukan kapan pendekatan ini tepat digunakan`,
+      `Membuat artefak kecil yang menunjukkan pemahaman yang bisa dipakai`,
+    ],
+    sections: [
+      {
+        id: `${key}-fondasi`,
+        title: 'Fondasi',
+        summary: 'Bangun model mental dan kosakata yang diperlukan sebelum berlatih.',
+        position: 0,
+        lessons: [
+          { id: `${key}-model-mental`, title: `Model mental ${topic}`, summary: 'Beberapa konsep utama yang membuat bagian lain lebih mudah dipahami.', estimatedMinutes: 12, position: 0 },
+          { id: `${key}-blok-dasar`, title: 'Blok dasar', summary: 'Cara bagian-bagian penting saling terhubung dan kesalahan yang sering terjadi.', estimatedMinutes: 14, position: 1 },
+        ],
+      },
+      {
+        id: `${key}-praktik`,
+        title: 'Praktik',
+        summary: 'Pindahkan pemahaman ke penerapan kecil yang dapat diamati.',
+        position: 1,
+        lessons: [
+          { id: `${key}-alur-pertama`, title: `Alur pertama untuk ${topic}`, summary: 'Proses konkret yang dapat kamu ulangi pada masalahmu sendiri.', estimatedMinutes: 18, position: 0 },
+          { id: `${key}-umpan-balik`, title: 'Umpan balik dan iterasi', summary: 'Cara membaca hasil, memilih perubahan bernilai tinggi, lalu mencoba lagi.', estimatedMinutes: 16, position: 1 },
+        ],
+      },
+      {
+        id: `${key}-integrasi`,
+        title: 'Integrasi',
+        summary: 'Gunakan keterampilan dalam konteks nyata dan ambil keputusan dengan batasan yang jelas.',
+        position: 2,
+        lessons: [
+          { id: `${key}-skenario-nyata`, title: `Skenario nyata untuk ${topic}`, summary: 'Contoh dengan ambiguitas, batasan, dan keputusan yang perlu dibuat.', estimatedMinutes: 20, position: 0 },
+          { id: `${key}-langkah-berikutnya`, title: 'Langkah berikutnya', summary: 'Ubah gagasan menjadi rencana latihan pribadi yang realistis.', estimatedMinutes: 10, position: 1 },
+        ],
+      },
+    ],
+  };
+}
+
+function fallbackRoadmap(topic: string, language: CourseLanguage = 'en'): Roadmap {
+  if (language === 'id') return indonesianFallbackRoadmap(topic);
   if (isDecisionDataTopic(topic)) {
     return decisionDataRoadmap(topic);
   }
@@ -1100,6 +1226,7 @@ function fallbackRoadmap(topic: string): Roadmap {
     title: `${topic}: a practical learning path`,
     description: `A focused path from first principles to confident application of ${topic}. Each subchapter is generated when you open it so the course stays relevant to your pace.`,
     topic,
+    language: 'en',
     outcomes: [
       `Explain the core ideas behind ${topic} in plain language`,
       `Apply ${topic} to a realistic problem with a repeatable process`,
@@ -1204,21 +1331,25 @@ function productBriefLesson(input: LessonGenerationInput) {
   };
 }
 
-export async function generateRoadmap(topic: string, userId: string) {
-  const parsed = TopicInputSchema.parse({ topic });
+export async function generateRoadmap(topic: string, userId: string, language: CourseLanguage = 'en') {
+  const parsed = TopicInputSchema.parse({ topic, language });
   const settings = getFixedProviderSettings();
-  return callTool({
+  const generated = await callTool({
     key: 'roadmap',
     schema: RoadmapSchema,
     settings,
     userId,
-    system: 'You are Synau, an exacting learning designer. Create a coherent course roadmap. Use 3 to 5 sections with 2 to 4 subchapters each. Sequence concepts from foundations to practice to integration. Avoid vague titles and duplicate coverage. Return only the requested tool call.',
-    user: `Topic: ${parsed.topic}\nKeep the path practical for a motivated adult learner.`,
-    fallback: () => fallbackRoadmap(parsed.topic),
+    system: `You are Synau, an exacting learning designer. Create a coherent course roadmap in ${parsed.language === 'id' ? 'natural Indonesian (Bahasa Indonesia)' : 'English'}. Use 3 to 5 sections with 2 to 4 subchapters each. Sequence concepts from foundations to practice to integration. Avoid vague titles and duplicate coverage. Return only the requested tool call.`,
+    user: `Topic: ${parsed.topic}\nLanguage: ${parsed.language}\nKeep the path practical for a motivated adult learner.`,
+    fallback: () => fallbackRoadmap(parsed.topic, parsed.language),
   });
+  return RoadmapSchema.parse({ ...generated, language: parsed.language });
 }
 
 function fallbackLesson(input: LessonGenerationInput): LessonMaterial {
+  if (input.language === 'id') {
+    return indonesianLesson(input);
+  }
   if (/product brief|writing better product briefs/i.test(input.topic)) {
     return productBriefLesson(input);
   }
@@ -1279,60 +1410,174 @@ function ensureInlineSourceCitations(material: LessonMaterial): LessonMaterial {
     for (const paragraph of section.paragraphs) {
       for (const match of paragraph.matchAll(/\[\[([^\]]+)\]\]/g)) cited.add(match[1]);
     }
+    for (const block of section.content) {
+      for (const match of lessonArticleBlockContext(block).matchAll(/\[\[([^\]]+)\]\]/g)) cited.add(match[1]);
+      if (block.type === 'quote' && block.sourceId) cited.add(block.sourceId);
+    }
   }
   const missing = material.sources.filter((source) => !cited.has(source.id));
   if (missing.length === 0) return material;
 
-  const sentence = `For further reading on this topic, see ${missing.map((source) => `[[${source.id}]]`).join(', ')}.`;
+  // Keep the article's voice intact. If a model forgets an inline citation,
+  // add only the clickable markers; never inject a translated stock sentence
+  // into the learner's prose.
+  const citationMarkers = ` ${missing.map((source) => `[[${source.id}]]`).join(' ')}`;
   const sections = material.article.sections.map((section) => ({
     ...section,
     paragraphs: [...section.paragraphs],
+    content: [...section.content],
   }));
   let inserted = false;
-  for (const section of sections) {
-    for (let index = 0; index < section.paragraphs.length; index += 1) {
+  for (const section of [...sections].reverse()) {
+    for (let index = section.content.length - 1; index >= 0; index -= 1) {
+      const block = section.content[index];
+      if (block.type !== 'paragraph') continue;
+      if (block.text.length + citationMarkers.length <= 1400) {
+        section.content[index] = { ...block, text: `${block.text}${citationMarkers}` };
+        inserted = true;
+        break;
+      }
+    }
+    if (inserted) break;
+    for (let index = section.paragraphs.length - 1; index >= 0; index -= 1) {
       const paragraph = section.paragraphs[index];
-      if (paragraph.length + sentence.length + 1 <= 1400) {
-        section.paragraphs[index] = `${paragraph} ${sentence}`;
+      if (paragraph.length + citationMarkers.length <= 1400) {
+        section.paragraphs[index] = `${paragraph}${citationMarkers}`;
         inserted = true;
         break;
       }
     }
     if (inserted) break;
   }
-  if (!inserted && sections[0].paragraphs.length < 3) {
-    sections[0].paragraphs.push(sentence);
-    inserted = true;
+  return inserted ? { ...material, article: { sections } } : material;
+}
+
+function lessonWords(value: string) {
+  return new Set(
+    value
+      .replace(/\[\[[^\]]+\]\]/g, ' ')
+      .toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .split(/\s+/)
+      .filter((word) => word.length > 2),
+  );
+}
+
+function lessonWordOverlap(left: string, right: string) {
+  const leftWords = lessonWords(left);
+  const rightWords = lessonWords(right);
+  if (leftWords.size === 0 || rightWords.size === 0) return 0;
+  let shared = 0;
+  for (const word of leftWords) if (rightWords.has(word)) shared += 1;
+  return shared / Math.min(leftWords.size, rightWords.size);
+}
+
+function lessonNeedsDiagram(input: LessonGenerationInput) {
+  const text = `${input.topic} ${input.sectionTitle} ${input.lessonTitle} ${input.lessonSummary}`.toLocaleLowerCase();
+  return /\b(workflow|process|sequence|framework|lifecycle|pipeline|funnel|journey|feedback loop|decision tree|causal chain|cause and effect|relationship|intersection|overlap|matrix|three circles|niche|passion|positioning|target audience|value proposition|alur|proses|langkah|kerangka|siklus|hubungan|sebab|akibat|irisan|lingkaran|tahapan)\b/i.test(text);
+}
+
+function firstLessonParagraph(lesson: LessonMaterial) {
+  for (const section of lesson.article.sections) {
+    const richParagraph = section.content.find((block) => block.type === 'paragraph');
+    if (richParagraph?.type === 'paragraph') return richParagraph.text;
+    if (section.paragraphs[0]) return section.paragraphs[0];
   }
-  if (!inserted) {
-    const paragraph = sections[0].paragraphs[0];
-    const room = Math.max(40, 1400 - sentence.length - 1);
-    sections[0].paragraphs[0] = `${paragraph.slice(0, room).trimEnd()} ${sentence}`;
+  return '';
+}
+
+const GeneratedLessonMaterialSchema = LessonMaterialSchema.superRefine((lesson, ctx) => {
+  if (lesson.article.sections.length === 0) return;
+  const overviewSentences = lesson.overview.split(/[.!?]+/).map((part) => part.trim()).filter(Boolean);
+  if (overviewSentences.length < 2) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['overview'], message: 'The lesson overview must be a two-sentence editorial deck, not a one-line summary.' });
   }
+  const firstSection = lesson.article.sections[0];
+  if (firstSection.content.length > 0 && firstSection.content[0]?.type !== 'paragraph') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', 0, 'content', 0], message: 'The article must begin with a paragraph before any diagram, code, equation, table, or quote.' });
+  }
+  const opening = firstLessonParagraph(lesson);
+  if (!opening) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', 0], message: 'The article must open with a natural paragraph before optional visual blocks.' });
+    return;
+  }
+  if (opening.split(/\s+/).filter(Boolean).length < 45) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', 0], message: 'The opening paragraph needs enough substance to feel like an article, not a one-line lesson summary.' });
+  }
+  if (lessonWordOverlap(lesson.overview, opening) >= 0.78) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', 0], message: 'The opening paragraph repeats the overview. Start with a distinct concrete hook or situation.' });
+  }
+});
+
+function lessonGenerationSchema(input: LessonGenerationInput) {
+  return GeneratedLessonMaterialSchema.superRefine((lesson, ctx) => {
+    if (lessonNeedsDiagram(input) && !lesson.article.sections.some((section) => section.content.some((block) => block.type === 'mermaid'))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article'], message: 'This lesson has a process, framework, relationship, or sequence that needs one simple Mermaid diagram placed after the relevant explanation.' });
+    }
+  });
+}
+
+function addFallbackLessonDiagram(material: LessonMaterial, input: LessonGenerationInput) {
+  if (!lessonNeedsDiagram(input) || material.article.sections.some((section) => section.content.some((block) => block.type === 'mermaid'))) return material;
+  const sections = material.article.sections.map((section) => ({ ...section, paragraphs: [...section.paragraphs], content: [...section.content] }));
+  const target = sections[0];
+  if (!target || target.content.length >= 10) return material;
+  const paragraphIndex = target.content.findIndex((block) => block.type === 'paragraph');
+  const diagram = {
+    type: 'mermaid' as const,
+    code: 'flowchart LR\n  A[Frame the question] --> B[Make one deliberate move]\n  B --> C[Inspect the signal]\n  C --> D[Revise the next move]',
+    caption: 'A compact learning loop for turning an idea into an observable next step',
+  };
+  target.content.splice(paragraphIndex >= 0 ? paragraphIndex + 1 : 0, 0, diagram);
   return { ...material, article: { sections } };
 }
+
+const LESSON_GENERATION_SYSTEM_PROMPT = `You are Synau's senior curriculum editor and article writer. Create one premium learning article for one subchapter, written for a motivated adult learner.
+
+The reading should feel like a thoughtful Medium essay or a high-quality professional course: confident, clear, warm, specific, and close to the learner without sounding casual or salesy. Write in the learner's language; if the topic and brief are Indonesian, use natural Indonesian rather than translated English. Do not write a slide deck, outline, card collection, or generic summary.
+
+Editorial shape:
+- The overview is an editorial deck of 2 sentences: establish the stakes and promise what the reader will be able to see or do. It must not repeat the lesson title, brief, or opening paragraph.
+- Open the article with a concrete tension, recognizable situation, question, surprising observation, or useful contrast. The first paragraph must be a distinct, substantial paragraph of at least 45 words; never begin with “In this lesson”, “This subchapter”, “Teknik…”, or a one-sentence restatement of the brief.
+- Build a natural arc suited to the topic: context or problem, the mental model, how it works, a concrete example or implication, and a transfer or boundary. Use 3 to 5 sections when the topic supports it. Give each section real prose; do not manufacture headings just to fill a template.
+- Prefer paragraphs as the primary medium. Vary sentence rhythm, explain important terms at first use, use concrete details, and let the reasoning develop. Avoid motivational filler, repeated conclusions, mechanical numbering, “first/second/third” lists unless the subject truly requires sequence, and awkward translated phrasing.
+
+Representation decision:
+- Before writing, identify the lesson's dominant structure. If it contains a process, sequence, causal chain, feedback loop, decision tree, system relationship, framework, lifecycle, or spatial relationship, include one clean Mermaid diagram. This is a positive requirement for those structures, not a rare fallback: prose explains the meaning and the diagram lets the reader see the relationships at a glance.
+- Use a Mermaid block for flowcharts, sequences, causal loops, decision trees, or system relationships. Keep it simple, valid Mermaid, and place it immediately after the prose that explains it. Include a short caption. Do not use a decorative diagram for a purely narrative or definitional idea.
+- Use a code block only when executable code or a command is genuinely part of the topic; an equation only when a formula is central; and a table only when rows make a real comparison or classification clearer. Optional blocks must support the article rather than interrupt it. Never force a format and never invent an unsupported format.
+
+Output rules:
+- Return 2 to 5 sections with an ordered content stream using only paragraph, code, equation, mermaid, table, and quote blocks. Keep paragraphs at least 45 words where the article is explaining an idea. Do not return legacy nodes, blocks, practice, reflection, source-note, or dataLab fields.
+- Use 1 to 3 relevant sources with stable URLs you know are real. Cite claims naturally inline with [[source-id]]; do not append a generic citation sentence or cite a source for a claim it does not support. References are shown separately at the end.
+- Label illustrative assumptions in the prose. Return only the requested tool call.`;
 
 export async function generateLesson(input: LessonGenerationInput, userId: string) {
   const parsed = LessonGenerationInputSchema.parse(input);
   const settings = getFixedProviderSettings();
+  const fallback = () => addFallbackLessonDiagram(fallbackLesson(parsed), parsed);
   const generated = await callTool({
     key: 'lesson',
-    schema: LessonMaterialSchema,
+    schema: lessonGenerationSchema(parsed),
     settings,
     userId,
-    system: 'You are Synau, a concise expert instructor. Write one flowing article for one subchapter. The article is the lesson; do not turn the main reading into numbered cards. Return 2 to 5 sections with 1 to 3 natural paragraphs each, no section numbering, and a clear progression from idea to example to application. Include 1 to 3 relevant sources with stable URLs you know are real; use ids src-1, src-2, etc. Cite a source inline with [[source-id]] only when the claim is supported by it, and never invent a citation or URL. Supporting components are optional: return 0 to 2 nodes only when a flow, comparison, scenario, timeline, code walkthrough, or worked example genuinely improves the article. Allowed node fields: prose(heading,body,bullets); example(heading,context,steps,insight); comparison(heading,leftLabel,rightLabel,rows); scenario(heading,situation,choices,prompt,reasoning); flow(heading,sequence[{label,description}],outcome); timeline(heading,events[{label,description}]); code(heading,language,code,explanation,bullets). Keep the article compact, label illustrative assumptions, do not return blocks, practice, or dataLab, and return only the requested tool call.',
-    user: `Course: ${parsed.courseTitle}\nTopic: ${parsed.topic}\nSection: ${parsed.sectionTitle}\nSubchapter ID: ${parsed.lessonId}\nSubchapter: ${parsed.lessonTitle}\nBrief: ${parsed.lessonSummary}\nPreviously covered course memory:\n${parsed.courseMemory.join('\n') || 'None yet.'}`,
-    fallback: () => fallbackLesson(parsed),
+    system: LESSON_GENERATION_SYSTEM_PROMPT,
+    user: `Course: ${parsed.courseTitle}\nTopic: ${parsed.topic}\nLanguage: ${parsed.language}\nSection: ${parsed.sectionTitle}\nSubchapter ID: ${parsed.lessonId}\nSubchapter: ${parsed.lessonTitle}\nBrief: ${parsed.lessonSummary}\nPreviously covered course memory:\n${parsed.courseMemory.join('\n') || 'None yet.'}`,
+    fallback,
   });
-  const fallback = fallbackLesson(parsed);
+  const fallbackMaterial = fallback();
   const material = LessonMaterialSchema.parse({
     ...generated,
     lessonId: parsed.lessonId,
-    article: generated.article.sections.length > 0 ? generated.article : fallback.article,
-    sources: generated.sources.length > 0 ? generated.sources : fallback.sources,
-    nodes: generated.nodes.length > 0 ? generated.nodes : fallback.nodes,
-    practice: generated.practice ?? fallback.practice,
-    dataLab: generated.dataLab ?? fallback.dataLab,
+    article: generated.article.sections.length > 0 ? generated.article : fallbackMaterial.article,
+    sources: generated.sources.length > 0 ? generated.sources : fallbackMaterial.sources,
+    // Legacy fields stay parseable for old rows but never enter new lesson output.
+    blocks: [],
+    nodes: [],
+    practice: undefined,
+    dataLab: undefined,
+    reflectivePrompt: undefined,
+    sourceNote: undefined,
   });
   return LessonMaterialSchema.parse(ensureInlineSourceCitations(material));
 }
@@ -1445,16 +1690,141 @@ function fallbackQuiz(input: QuizGenerationInput): Quiz {
   };
 }
 
+function quizAnchors(input: QuizGenerationInput) {
+  const anchors = input.materialContext
+    .map((entry) => entry.replace(/\s+/g, ' ').trim())
+    .filter((entry) => entry.length >= 24)
+    .map((entry) => entry.length > 180 ? `${entry.slice(0, 177).trimEnd()}...` : entry)
+    .slice(0, 3);
+  while (anchors.length < 3) {
+    const fallback = `${input.scopeTitle}: ${input.topic}`;
+    anchors.push(fallback.length > 180 ? `${fallback.slice(0, 177).trimEnd()}...` : fallback);
+  }
+  return anchors;
+}
+
+function quizAnswerFromAnchor(anchor: string) {
+  const sentence = anchor.split(/(?<=[.!?])\s+/)[0]?.trim() || anchor.trim();
+  return sentence.length > 220 ? `${sentence.slice(0, 217).trimEnd()}...` : sentence;
+}
+
+function diversifyQuizAnswerPositions(quiz: GeneratedQuiz): GeneratedQuiz {
+  const preferredPositions = [0, 1, 2];
+  return {
+    ...quiz,
+    questions: quiz.questions.map((question, index) => {
+      const targetPosition = Math.min(preferredPositions[index] ?? index, question.options.length - 1);
+      if (question.answerIndex === targetPosition) return question;
+      const options = [...question.options];
+      [options[question.answerIndex], options[targetPosition]] = [options[targetPosition], options[question.answerIndex]];
+      return { ...question, options, answerIndex: targetPosition };
+    }),
+  };
+}
+
+function fallbackGeneratedQuiz(input: QuizGenerationInput) {
+  if (input.language === 'id') {
+    const base = fallbackQuiz(input);
+    const anchors = quizAnchors(input);
+    return GeneratedQuizSchema.parse({
+      ...base,
+      title: `${input.scopeTitle}: ulasan berbahasa Indonesia`,
+      instructions: 'Gunakan materi bacaan sebagai dasar. Kuis ini dapat diulang kapan saja dan tidak mengunci progres.',
+      questions: [
+        {
+          id: `${input.scope}-${input.scopeId}-1`,
+          prompt: 'Pernyataan mana yang didukung langsung oleh artikel?',
+          options: [anchors[0], 'Artikel menyarankan melewati konteks sebelum bertindak.', 'Artikel menyatakan semua situasi dapat diperlakukan sama.', 'Artikel menghapus kebutuhan untuk memeriksa bukti.'],
+          answerIndex: 0,
+          explanation: 'Jawaban ini dirujuk langsung oleh konteks artikel yang tersedia.',
+          kind: 'article' as const,
+          articleAnchor: anchors[0],
+        },
+        {
+          id: `${input.scope}-${input.scopeId}-2`,
+          prompt: 'Gagasan kedua apa yang dinyatakan secara jelas dalam artikel?',
+          options: ['Salin solusi pertama tanpa memeriksa hasilnya.', anchors[1], 'Tambahkan kompleksitas sebelum menguji apa pun.', 'Kendala tidak perlu disebutkan.'],
+          answerIndex: 1,
+          explanation: 'Jawaban ini merupakan parafrasa langsung dari konteks artikel.',
+          kind: 'article' as const,
+          articleAnchor: anchors[1],
+        },
+        {
+          id: `${input.scope}-${input.scopeId}-3`,
+          prompt: 'Situasi baru mengubah satu kendala penting. Langkah mana yang paling tepat?',
+          options: ['Sesuaikan gagasan dengan kendala baru, tentukan sinyal, lalu periksa hasilnya.', 'Salin respons lama tanpa memeriksa kecocokannya.', 'Perluas cakupan sampai semua trade-off hilang.', 'Abaikan bukti karena contoh awal pernah berhasil.'],
+          answerIndex: 0,
+          explanation: 'Tantangan meminta kamu memindahkan gagasan artikel ke situasi baru dan menggunakan bukti untuk memilih langkah berikutnya.',
+          kind: 'challenge' as const,
+          articleAnchor: anchors[2],
+        },
+      ],
+    });
+  }
+  const base = fallbackQuiz(input);
+  const anchors = quizAnchors(input);
+  const directQuestions = [0, 1].map((index) => {
+    const answer = quizAnswerFromAnchor(anchors[index]);
+    const options = index === 0
+      ? [answer, 'The material says context can be skipped before acting.', 'The material recommends adding scope before checking evidence.', 'The material treats every situation as interchangeable.']
+      : ['The material recommends copying the first available solution.', answer, 'The material says a result cannot be inspected.', 'The material removes the need to name a constraint.'];
+    return {
+      id: `${input.scope}-${input.scopeId}-${index + 1}`,
+      prompt: index === 0
+        ? 'Which statement is directly supported by the article?'
+        : 'Which second idea is explicitly stated in the article?',
+      options,
+      answerIndex: index,
+      explanation: 'The correct answer is stated directly in the supplied article context.',
+      kind: 'article' as const,
+      articleAnchor: anchors[index],
+    };
+  });
+  const challenge = {
+    id: `${input.scope}-${input.scopeId}-3`,
+    prompt: `A new situation changes one important constraint in ${input.scopeTitle.toLowerCase()}. Which next move best transfers the article's idea?`,
+    options: ['Adapt the article’s idea to the changed constraint, define a signal, and inspect the result.', 'Copy the original response without checking whether the constraint still fits.', 'Add more scope until no trade-off remains.', 'Ignore the evidence because the original example worked once.'],
+    answerIndex: 0,
+    explanation: 'The challenge asks you to transfer the article’s idea to a new situation, make the constraint visible, and use evidence to refine the next move.',
+  };
+  return GeneratedQuizSchema.parse({
+    ...base,
+    questions: [
+      ...directQuestions,
+      { ...challenge, kind: 'challenge' as const, articleAnchor: anchors[2] },
+    ],
+  });
+}
+
 export async function generateQuiz(input: QuizGenerationInput, userId: string) {
   const parsed = QuizGenerationInputSchema.parse(input);
   const settings = getFixedProviderSettings();
-  return callTool({
+  const compactPromptContext = (entries: string[], maxCharacters: number) => {
+    const output: string[] = [];
+    let used = 0;
+    for (const entry of entries) {
+      const normalized = entry.replace(/\s+/g, ' ').trim();
+      if (!normalized) continue;
+      const remaining = maxCharacters - used;
+      if (remaining < 80) break;
+      const clipped = normalized.length > Math.min(560, remaining)
+        ? `${normalized.slice(0, Math.min(557, remaining - 3)).trimEnd()}...`
+        : normalized;
+      output.push(clipped);
+      used += clipped.length + 1;
+    }
+    return output;
+  };
+  const materialPromptContext = compactPromptContext(parsed.materialContext, 8_000);
+  const memoryPromptContext = compactPromptContext(parsed.courseMemory, 3_000);
+  const generated = await callTool({
     key: 'quiz',
-    schema: QuizSchema,
+    schema: GeneratedQuizSchema,
     settings,
     userId,
-    system: 'You are Synau, an assessment designer. Write a fair, repeatable, low-stakes quiz. Test topic-specific understanding and decisions, not product-system trivia. Use a realistic scenario or worked example when possible. Keep answer options plausible, vary the correct answer position, and make explanations point back to the lesson. Return only the requested tool call.',
-    user: `Course: ${parsed.courseTitle}\nTopic: ${parsed.topic}\nScope: ${parsed.scope}\nScope title: ${parsed.scopeTitle}\nMaterial context:\n${parsed.materialContext.join('\n') || 'Use the scope title and topic.'}\nCourse memory:\n${parsed.courseMemory.join('\n') || 'None yet.'}`,
-    fallback: () => fallbackQuiz(parsed),
+    system: 'You are Synau, an assessment designer. Write a fair, repeatable, low-stakes quiz grounded only in the supplied lesson material. Return exactly 3 questions in this order: two article questions whose correct answers are directly stated or unambiguously paraphrased in the material, followed by one challenge question that applies the same concepts to a new but relevant situation and requires analysis. Mark the first two kind=article and the last kind=challenge. Every question needs an articleAnchor of 8 to 180 characters copied from or closely matching the supplied material. Use exactly 4 unique plausible options per question, keep each option under 180 characters and each explanation under 280 characters, vary answer positions, keep explanations tied to the material, and return only the requested tool call. Do not test product-system trivia, unrelated background knowledge, or concepts absent from the material.',
+    user: `Course: ${parsed.courseTitle}\nTopic: ${parsed.topic}\nLanguage: ${parsed.language}\nScope: ${parsed.scope}\nScope title: ${parsed.scopeTitle}\nMaterial context (the only source of truth for article questions):\n${materialPromptContext.join('\n') || 'No generated material is available; use the scope brief conservatively.'}\nCourse memory (use only to avoid repeating the same angle):\n${memoryPromptContext.join('\n') || 'None yet.'}`,
+    fallback: () => fallbackGeneratedQuiz(parsed),
   });
+  return diversifyQuizAnswerPositions(generated);
 }

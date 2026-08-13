@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { api } from '../api';
+import { api, CREDITS_CHANGED_EVENT } from '../api';
 import type { Course, Roadmap } from '../types';
 import { Icon } from './Icon';
 import { RoadmapPreview } from './RoadmapPreview';
@@ -10,9 +10,15 @@ type DashboardProps = {
 };
 
 const topicSuggestions = [
-  'Data storytelling',
-  'Product discovery interviews',
-  'Personal finance fundamentals',
+  'Learn digital marketing from zero',
+  'Start a small online business',
+  'Python for beginners',
+  'Learn project management from zero',
+  'Learn sales conversations from zero',
+  'Learn customer service basics',
+  'Learn UX research from zero',
+  'Understand financial reports for non-finance roles',
+  'Prepare for your first internship',
 ];
 
 type CourseCardProps = {
@@ -88,7 +94,13 @@ export function CourseCard({ course, onOpen, onRename, onDelete }: CourseCardPro
         <span>{course.sections.length} sections</span>
         <span>Started {started}</span>
       </div>
-      <button className="course-card__action" onClick={onOpen} type="button">
+      <button
+        className="course-card__action"
+        onClick={onOpen}
+        onFocus={() => { void api.prefetchCourse(course.id); }}
+        onMouseEnter={() => { void api.prefetchCourse(course.id); }}
+        type="button"
+      >
         <span>
           <small>{course.progress.percent === 100 ? 'Course complete' : nextLesson ? 'Continue with' : 'Open course'}</small>
           <strong>{course.progress.percent === 100 ? 'Review your learning' : nextLesson?.title ?? 'View learning path'}</strong>
@@ -252,6 +264,7 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [topic, setTopic] = useState('');
+  const [language, setLanguage] = useState<'en' | 'id'>('en');
   const [roadmap, setRoadmap] = useState<Roadmap | null>(null);
   const [generating, setGenerating] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -274,6 +287,13 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
 
   useEffect(() => {
     let active = true;
+    const loadCredits = (force = false) => api.credits(force)
+      .then(({ credits }) => {
+        if (active) setCreditBalance(credits.balance);
+      })
+      .catch(() => {
+        if (active) setCreditBalance(null);
+      });
     api.courses()
       .then(({ courses: loadedCourses }) => {
         if (active) {
@@ -287,14 +307,13 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
       .finally(() => {
         if (active) setLoading(false);
       });
-    api.credits()
-      .then(({ credits }) => {
-        if (active) setCreditBalance(credits.balance);
-      })
-      .catch(() => {
-        if (active) setCreditBalance(null);
-      });
-    return () => { active = false; };
+    void loadCredits();
+    const handleCreditsChanged = () => { void loadCredits(); };
+    window.addEventListener(CREDITS_CHANGED_EVENT, handleCreditsChanged);
+    return () => {
+      active = false;
+      window.removeEventListener(CREDITS_CHANGED_EVENT, handleCreditsChanged);
+    };
   }, []);
 
   async function generate(event?: FormEvent<HTMLFormElement>) {
@@ -308,7 +327,7 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
     setFormError('');
     setCreateError('');
     try {
-      const result = await api.generateRoadmap(cleanTopic);
+      const result = await api.generateRoadmap(cleanTopic, language);
       setRoadmap(result.roadmap);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Could not generate a roadmap.');
@@ -348,13 +367,17 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
 
   async function renameCourse(title: string) {
     if (!editingCourse) return;
+    const previousCourses = courses;
+    const optimisticCourse = { ...editingCourse, title };
     setManagerBusy('rename');
     setManagerError('');
+    setCourses((current) => current.map((item) => item.id === optimisticCourse.id ? optimisticCourse : item));
     try {
       const { course } = await api.renameCourse(editingCourse.id, title);
       setCourses((current) => current.map((item) => item.id === course.id ? course : item));
       setEditingCourse(null);
     } catch (error) {
+      setCourses(previousCourses);
       setManagerError(error instanceof Error ? error.message : 'Could not rename this learning path.');
     } finally {
       setManagerBusy(null);
@@ -363,13 +386,15 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
 
   async function deleteCourse() {
     if (!deletingCourse) return;
+    const previousCourses = courses;
     setManagerBusy('delete');
     setManagerError('');
+    setCourses((current) => current.filter((item) => item.id !== deletingCourse.id));
     try {
       await api.deleteCourse(deletingCourse.id);
-      setCourses((current) => current.filter((item) => item.id !== deletingCourse.id));
       setDeletingCourse(null);
     } catch (error) {
+      setCourses(previousCourses);
       setManagerError(error instanceof Error ? error.message : 'Could not delete this course.');
     } finally {
       setManagerBusy(null);
@@ -411,14 +436,30 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
 
       <section className="topic-builder" aria-labelledby="topic-builder-title">
         <div className="topic-builder__lead">
-          <span className="topic-builder__index">New path</span>
           <div>
             <h2 id="topic-builder-title">Build a course around your goal</h2>
             <p>Specific topics produce more useful learning paths.</p>
           </div>
         </div>
         <form className="topic-form" onSubmit={(event) => void generate(event)}>
-          <label htmlFor="topic-input">I want to learn</label>
+          <div className="topic-form__controls">
+            <label htmlFor="topic-input">I want to learn</label>
+            <div aria-label="Course language" className="language-toggle" role="group">
+              <span>Language</span>
+              {(['en', 'id'] as const).map((option) => (
+                <button
+                  aria-pressed={language === option}
+                  className={language === option ? 'is-active' : ''}
+                  disabled={generating}
+                  key={option}
+                  onClick={() => setLanguage(option)}
+                  type="button"
+                >
+                  {option.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="topic-form__input-row">
             <input
               aria-describedby={formError ? 'topic-error' : 'topic-help'}

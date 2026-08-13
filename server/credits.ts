@@ -6,6 +6,7 @@ import { createSnapToken, getMidtransTransactionStatus } from './midtrans.js';
 import {
   CreditSummarySchema,
   CreditTransactionSchema,
+  RedeemCreditResponseSchema,
   TopUpResponseSchema,
   type CreditProduct,
   type CreditSummary,
@@ -16,6 +17,7 @@ const demoCredits = Math.max(0, Math.floor(Number(process.env.SYNAU_DEMO_CREDITS
 const GENERATOR_CREDIT_COST = 1;
 const STALE_HOLD_RECOVERY_MS = 15 * 60 * 1_000;
 export const NEW_USER_FREE_CREDITS = 100;
+const PROMO_CREDITS = 1_500;
 
 export const CREDIT_PRODUCTS: CreditProduct[] = [
   { id: 'topup-15000', label: '1.500 credits', baseCredits: 1_500, bonusCredits: 0, credits: 1_500, amountIdr: 15_000 },
@@ -49,6 +51,14 @@ function providerSummary() {
 function ensureAccountTx(userId: string) {
   db.prepare(`INSERT OR IGNORE INTO credit_accounts (user_id, balance, updated_at) VALUES (?, 0, ?)`)
     .run(userId, nowIso());
+}
+
+function ensureReviewerPromoCode() {
+  const existing = db.prepare('SELECT id FROM credit_promo_codes WHERE active = 1 AND credits = ? LIMIT 1').get(PROMO_CREDITS) as { id: string } | undefined;
+  if (existing) return;
+  const token = `SYN-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+  db.prepare(`INSERT INTO credit_promo_codes (id, token, credits, active, max_redemptions, redeemed_count, created_at)
+    VALUES (?, ?, ?, 1, 1, 0, ?)`).run(newId(), token, PROMO_CREDITS, nowIso());
 }
 
 function applyCreditDeltaTx(args: {
@@ -162,11 +172,46 @@ export function grantNewUserCredits(userId: string) {
 }
 
 export function ensureCredits(userId: string) {
+  ensureReviewerPromoCode();
   db.transaction(() => {
     ensureAccountTx(userId);
   })();
   recoverStaleLlmHolds(userId);
   ensureDemoGrant(userId);
+}
+
+export function redeemCreditToken(userId: string, rawToken: string) {
+  const token = rawToken.trim().toUpperCase();
+  if (!token) throw new CreditError('Enter a redeem token.', 400, 'invalid_redeem_token');
+  ensureCredits(userId);
+  return db.transaction(() => {
+    const promo = db.prepare(`SELECT id, credits, max_redemptions, redeemed_count
+      FROM credit_promo_codes WHERE token = ? AND active = 1`).get(token) as {
+        id: string; credits: number; max_redemptions: number; redeemed_count: number;
+      } | undefined;
+    if (!promo) throw new CreditError('This redeem token is invalid or inactive.', 400, 'invalid_redeem_token');
+    const already = db.prepare('SELECT id FROM credit_promo_redemptions WHERE promo_code_id = ? AND user_id = ?')
+      .get(promo.id, userId) as { id: string } | undefined;
+    if (already) {
+      const balance = (db.prepare('SELECT balance FROM credit_accounts WHERE user_id = ?').get(userId) as { balance: number }).balance;
+      return RedeemCreditResponseSchema.parse({ creditsAdded: 0, alreadyRedeemed: true, balance });
+    }
+    if (promo.redeemed_count >= promo.max_redemptions) throw new CreditError('This redeem token has already been claimed.', 409, 'redeem_token_exhausted');
+    const redemptionId = newId();
+    db.prepare(`INSERT INTO credit_promo_redemptions (id, promo_code_id, user_id, credits, created_at)
+      VALUES (?, ?, ?, ?, ?)`).run(redemptionId, promo.id, userId, promo.credits, nowIso());
+    db.prepare('UPDATE credit_promo_codes SET redeemed_count = redeemed_count + 1 WHERE id = ?').run(promo.id);
+    applyCreditDeltaTx({
+      userId,
+      delta: promo.credits,
+      type: 'grant',
+      referenceId: `promo:${redemptionId}:credit`,
+      description: `Redeem token credit grant (${promo.credits.toLocaleString('id-ID')} credits)`,
+      metadata: { redemptionId, promoCodeId: promo.id },
+    });
+    const balance = (db.prepare('SELECT balance FROM credit_accounts WHERE user_id = ?').get(userId) as { balance: number }).balance;
+    return RedeemCreditResponseSchema.parse({ creditsAdded: promo.credits, alreadyRedeemed: false, balance });
+  })();
 }
 
 function currentBalance(userId: string) {

@@ -44,61 +44,19 @@ try {
   await expect(page.getByText('Generate this lesson on demand.')).toBeVisible();
   evidence.push('lazy-lesson-not-prefetched');
   await page.locator('.course-rail .rail-lessons > button').first().click();
-  await expect(page.locator('.lesson-node').first()).toBeVisible();
-  evidence.push('lazy-lesson-generated');
-  await expect(page.locator('.lesson-node:not(.lesson-node--prose)').first()).toBeVisible();
-  await expect(page.locator('.lesson-node--prose').first()).toHaveCSS('display', 'block');
-  evidence.push('dynamic-lesson-renderer');
-
-  for (const genericLabel of [
-    'A useful lens',
-    'Look at it another way',
-    'A useful sequence',
-    'Compare the choices',
-    'Reflect',
-    'Make the idea yours',
-    'Practice studio',
-    'Make one useful draft',
-    'Optional, never gated',
-    'Worked example',
-    'Decision scenario',
-    'Follow the progression',
-    'Code walkthrough',
-    'Data lab',
-    'Illustrative practice',
-    'Keep exploring',
-    'Interpret before revealing',
-    'Worked reading',
-    'What to notice',
-    'End state',
-    'Suggested sequence',
-    'Self-check rubric',
-    'Your draft',
-    'Try the prompts first. Revealing the reading is optional and never affects progress.',
-    'You do not need to submit an answer. Pause long enough to make it concrete.',
-    'A draft is for thinking, not for unlocking the next lesson.',
-  ]) {
-    await expect(page.locator('.lesson-article').getByText(genericLabel, { exact: true })).toHaveCount(0);
-  }
-  await expect(page.locator('.takeaway-card')).toContainText('Key takeaway');
-  await expect(page.locator('.lesson-source-note')).toContainText('About this material');
+  await expect(page.locator('.lesson-reading__section').first()).toBeVisible();
+  evidence.push('article-first-lesson');
+  const lessonOverview = await page.locator('.lesson-overview p').innerText();
+  const lessonOpening = await page.locator('.lesson-reading__section').first().locator('p').first().innerText();
+  if (lessonOverview.split(/[.!?]+/).map((part) => part.trim()).filter(Boolean).length < 2) throw new Error('Lesson overview must contain an editorial two-sentence deck.');
+  if (lessonOpening.split(/\s+/).filter(Boolean).length < 45) throw new Error('Lesson opening must be a substantial article paragraph.');
+  evidence.push('editorial-intro-quality');
+  await expect(page.locator('.lesson-takeaway')).toContainText('Key takeaway');
+  await expect(page.locator('.lesson-article .lesson-components, .lesson-article .lesson-node, .lesson-article .data-lab, .lesson-article .practice-studio, .lesson-article .lesson-source-note, .lesson-article .reflection-card, .lesson-article .takeaway-card')).toHaveCount(0);
+  await expect(page.locator('.lesson-article').getByText('About this material', { exact: true })).toHaveCount(0);
+  await expect(page.locator('.lesson-article').getByText('Practice studio', { exact: true })).toHaveCount(0);
   await expect(page.locator('.lesson-finish')).toContainText('End of subchapter');
-  evidence.push('lesson-labels-are-content-led');
-
-  const dataLab = page.locator('.data-lab');
-  await expect(dataLab).toBeVisible();
-  await expect(dataLab.locator('table')).toBeVisible();
-  await expect(dataLab.locator('.data-lab__worked')).toBeHidden();
-  await dataLab.getByRole('button', { name: /reveal worked reading/i }).click();
-  await expect(dataLab.locator('.data-lab__worked')).toBeVisible();
-  await expect(dataLab.locator('.data-lab__worked')).toContainText(/activity|outcome|completion rate/i);
-  evidence.push('data-lab-reveal');
-
-  await expect(page.locator('.practice-studio')).toBeVisible();
-  await page.getByLabel('Practice draft').fill('Frame one real decision and name the signal I will inspect.');
-  await page.getByRole('button', { name: /save draft/i }).click();
-  await expect(page.getByText(/Draft saved locally/)).toBeVisible();
-  evidence.push('practice-studio');
+  evidence.push('article-surface-has-no-legacy-cards');
 
   await page.getByRole('button', { name: /^Mark complete$/i }).click();
   await expect(page.locator('.status-chip--complete')).toBeVisible();
@@ -108,6 +66,10 @@ try {
   await expect(page.locator('.quiz-intro')).toBeVisible();
   await expect(page.locator('.quiz-panel')).toContainText(/appointment|metric|baseline|uncertainty|correlation|constraint/i);
   const questionSets = page.locator('fieldset.quiz-question');
+  await expect(questionSets).toHaveCount(3);
+  await expect(page.locator('.quiz-question').nth(0)).toContainText('From the article');
+  await expect(page.locator('.quiz-question').nth(1)).toContainText('From the article');
+  await expect(page.locator('.quiz-question').nth(2)).toContainText('Challenge');
   for (let index = 0; index < await questionSets.count(); index += 1) {
     await questionSets.nth(index).locator('.quiz-option').first().click();
   }

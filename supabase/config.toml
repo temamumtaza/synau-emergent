@@ -233,10 +233,6 @@ otp_length = 6
 # Number of seconds before the email OTP expires (defaults to 1 hour).
 otp_expiry = 3600
 
-# Supabase mode is configured as Google-only through the hosted Management API.
-# Keep this local config explicit for anyone running Supabase locally.
-enable_signup = false
-
 # Use a production-ready SMTP server (disabled for Synau Google-only mode)
 # [auth.email.smtp]
 # enabled = true

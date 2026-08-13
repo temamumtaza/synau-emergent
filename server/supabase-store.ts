@@ -1,5 +1,6 @@
 import { getSupabaseAdmin } from './supabase.js';
 import { newId, nowIso } from './db.js';
+import { recordSupabaseQuery } from './performance.js';
 import {
   CourseSchema,
   LessonMaterialSchema,
@@ -11,38 +12,6 @@ import {
   type Roadmap,
 } from '../shared/schemas.js';
 
-type RemoteCourse = {
-  id: string;
-  user_id: string;
-  topic: string;
-  title: string;
-  description: string;
-  outcomes_json: unknown;
-  status: 'active' | 'archived';
-  created_at: string;
-  updated_at: string;
-};
-
-type RemoteSection = {
-  id: string;
-  course_id: string;
-  title: string;
-  summary: string;
-  position: number;
-};
-
-type RemoteLesson = {
-  id: string;
-  section_id: string;
-  title: string;
-  summary: string;
-  estimated_minutes: number;
-  position: number;
-  material_json: unknown;
-  last_generated_at: string | null;
-  completed_at: string | null;
-};
-
 type RemoteLock = {
   user_id: string;
   course_id: string;
@@ -53,14 +22,16 @@ type RemoteLock = {
 
 type RemoteQueryResult<T> = { data: T; error: { message: string; code?: string } | null };
 
-async function read<T>(query: PromiseLike<RemoteQueryResult<T>>) {
-  const result = await query;
+async function read<T>(query: PromiseLike<RemoteQueryResult<T>>, kind: 'operation' | 'support' = 'support') {
+  const startedAt = performance.now();
+  let result: RemoteQueryResult<T>;
+  try {
+    result = await query;
+  } finally {
+    recordSupabaseQuery(performance.now() - startedAt, kind);
+  }
   if (result.error) throw new Error(`Supabase query failed: ${result.error.message}`);
   return result.data;
-}
-
-function outcomes(value: unknown) {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
 function material(value: unknown) {
@@ -69,64 +40,29 @@ function material(value: unknown) {
 
 export async function supabaseHealth() {
   const client = getSupabaseAdmin();
-  await read(client.from('users').select('id', { head: true, count: 'exact' }));
-}
-
-export async function remoteCourseRow(userId: string, courseId: string) {
-  return read(client().from('courses').select('*').eq('id', courseId).eq('user_id', userId).maybeSingle<RemoteCourse>());
+  await read(client.from('users').select('id', { head: true, count: 'exact' }), 'support');
 }
 
 function client() {
   return getSupabaseAdmin();
 }
 
-export async function remoteSerializeCourse(userId: string, courseId: string): Promise<Course | null> {
-  const course = await remoteCourseRow(userId, courseId);
-  if (!course) return null;
-  const sections = await read(client().from('course_sections').select('*').eq('course_id', courseId).order('position', { ascending: true }));
-  const typedSections = (sections as RemoteSection[]).sort((a, b) => a.position - b.position);
-  const sectionIds = typedSections.map((section) => section.id);
-  const lessons = sectionIds.length
-    ? await read(client().from('lessons').select('*').in('section_id', sectionIds).order('position', { ascending: true }))
-    : [];
-  const typedLessons = (lessons as RemoteLesson[]).sort((a, b) => a.position - b.position);
-  const completedLessons = typedLessons.filter((lesson) => lesson.completed_at).length;
-  return CourseSchema.parse({
-    id: course.id,
-    topic: course.topic,
-    title: course.title,
-    description: course.description,
-    outcomes: outcomes(course.outcomes_json),
-    status: course.status,
-    createdAt: course.created_at,
-    sections: typedSections.map((section) => ({
-      id: section.id,
-      title: section.title,
-      summary: section.summary,
-      position: section.position,
-      lessons: typedLessons.filter((lesson) => lesson.section_id === section.id).map((lesson) => ({
-        id: lesson.id,
-        sectionId: lesson.section_id,
-        title: lesson.title,
-        summary: lesson.summary,
-        estimatedMinutes: lesson.estimated_minutes,
-        position: lesson.position,
-        material: material(lesson.material_json),
-        completedAt: lesson.completed_at,
-      })),
-    })),
-    progress: {
-      completedLessons,
-      totalLessons: typedLessons.length,
-      percent: typedLessons.length ? Math.round((completedLessons / typedLessons.length) * 100) : 0,
-    },
-  });
+export async function remoteSerializeCourse(userId: string, courseId: string, materialLessonId?: string): Promise<Course | null> {
+  return remoteCourseWorkspace(userId, courseId, materialLessonId);
 }
 
 export async function remoteListCourses(userId: string) {
-  const rows = await read(client().from('courses').select('id').eq('user_id', userId).order('updated_at', { ascending: false }));
-  const courses = await Promise.all((rows as Array<{ id: string }>).map((row) => remoteSerializeCourse(userId, row.id)));
-  return courses.filter((course): course is Course => Boolean(course));
+  const value = await read(client().rpc('list_course_summaries', { p_user_id: userId }), 'operation');
+  return CourseSchema.array().parse(value ?? []);
+}
+
+export async function remoteCourseWorkspace(userId: string, courseId: string, materialLessonId?: string): Promise<Course | null> {
+  const value = await read(client().rpc('get_course_workspace_json', {
+    p_user_id: userId,
+    p_course_id: courseId,
+    p_material_lesson_id: materialLessonId ?? null,
+  }), 'operation');
+  return value ? CourseSchema.parse(value) : null;
 }
 
 export async function remoteCreateCourse(userId: string, roadmap: Roadmap) {
@@ -149,7 +85,7 @@ export async function remoteCreateCourse(userId: string, roadmap: Roadmap) {
       })),
     };
   });
-  await read(client().rpc('create_course_from_roadmap', {
+  const value = await read(client().rpc('create_course_from_roadmap_v3', {
     p_course_id: courseId,
     p_user_id: userId,
     p_topic: roadmap.topic,
@@ -157,74 +93,85 @@ export async function remoteCreateCourse(userId: string, roadmap: Roadmap) {
     p_description: roadmap.description,
     p_outcomes: roadmap.outcomes,
     p_sections: sectionRows,
-  }));
-  await remoteAddEvent(userId, courseId, 'course_created', undefined, { topic: roadmap.topic });
-  return remoteSerializeCourse(userId, courseId);
+    p_language: roadmap.language,
+  }), 'operation');
+  return CourseSchema.parse(value);
 }
 
 export async function remoteUpdateCourse(userId: string, courseId: string, patch: { title?: string; status?: 'active' | 'archived' }) {
-  const course = await remoteCourseRow(userId, courseId);
-  if (!course) return null;
-  const updatedAt = nowIso();
-  await read(client().from('courses').update({
-    ...(patch.title !== undefined ? { title: patch.title } : {}),
-    ...(patch.status !== undefined ? { status: patch.status } : {}),
-    updated_at: updatedAt,
-  }).eq('id', courseId).eq('user_id', userId));
-  if (patch.title !== undefined && patch.title !== course.title) {
-    await remoteAddEvent(userId, courseId, 'course_renamed', undefined, { from: course.title, to: patch.title });
-  }
-  if (patch.status !== undefined && patch.status !== course.status) {
-    await remoteAddEvent(userId, courseId, patch.status === 'archived' ? 'course_archived' : 'course_reopened');
-  }
-  return remoteSerializeCourse(userId, courseId);
+  const value = await read(client().rpc('update_course_and_event', {
+    p_user_id: userId,
+    p_course_id: courseId,
+    p_title: patch.title ?? null,
+    p_status: patch.status ?? null,
+  }), 'operation');
+  return value ? CourseSchema.parse(value) : null;
 }
 
 export async function remoteDeleteCourse(userId: string, courseId: string) {
-  const lock = await read(client().from('lesson_generation_locks').select('lesson_id').eq('user_id', userId).eq('course_id', courseId).maybeSingle<{ lesson_id: string }>());
-  if (lock) return { deleted: false as const, locked: true as const };
-  const result = await read(client().from('courses').delete().eq('id', courseId).eq('user_id', userId).select('id'));
-  return { deleted: (result as Array<{ id: string }>).length === 1, locked: false as const };
+  const value = await read(client().rpc('delete_course_if_unlocked', {
+    p_user_id: userId,
+    p_course_id: courseId,
+  }), 'operation') as { deleted?: boolean; locked?: boolean; notFound?: boolean } | null;
+  return {
+    deleted: value?.deleted === true,
+    locked: value?.locked === true,
+    notFound: value?.notFound === true,
+  } as const;
 }
 
-export async function remoteGetCourseMemory(courseId: string) {
-  const sections = await read(client().from('course_sections').select('id').eq('course_id', courseId));
-  const sectionIds = (sections as Array<{ id: string }>).map((section) => section.id);
-  if (!sectionIds.length) return [];
-  const rows = await read(client().from('lessons').select('title, material_json, last_generated_at').in('section_id', sectionIds).not('material_json', 'is', null).order('last_generated_at', { ascending: false }));
-  return (rows as Array<{ title: string; material_json: unknown }>).flatMap((row) => {
-    const parsed = material(row.material_json);
+export async function remoteGetCourseMemory(userId: string, courseId: string) {
+  const value = await read(client().rpc('get_course_memory_rows_json', { p_user_id: userId, p_course_id: courseId }), 'operation');
+  const rows = Array.isArray(value) ? value as Array<{ title?: unknown; material?: unknown }> : [];
+  return rows.flatMap((row) => {
+    const parsed = material(row.material);
     if (!parsed) return [];
-    const formats = parsed.nodes.length ? parsed.nodes.map((node) => node.type).join(', ') : 'legacy prose';
-    return [`${row.title}: ${parsed.keyTakeaway}`, `Prompt: ${parsed.reflectivePrompt}`, `Formats used: ${formats}`];
+    return [`${typeof row.title === 'string' ? row.title : 'Lesson'}: ${parsed.keyTakeaway}`, ...contextFromMaterial(parsed).slice(0, 3)];
   }).slice(0, 40);
 }
 
-export async function remoteCourseContext(courseId: string, scope: 'lesson' | 'chapter' | 'course', scopeId: string) {
-  if (scope === 'lesson') {
-    const row = await read(client().from('lessons').select('id, title, summary, material_json, course_sections!inner(title, course_id)').eq('id', scopeId).eq('course_sections.course_id', courseId).maybeSingle<{ title: string; summary: string; material_json: unknown }>()).catch(() => null);
-    if (!row) return null;
-    const parsed = material(row.material_json);
-    return { title: row.title, context: [row.summary, ...contextFromMaterial(parsed)] };
-  }
-  if (scope === 'chapter') {
-    const section = await read(client().from('course_sections').select('title').eq('id', scopeId).eq('course_id', courseId).maybeSingle<{ title: string }>());
-    if (!section) return null;
-    const rows = await read(client().from('lessons').select('title, summary, material_json').eq('section_id', scopeId).order('position', { ascending: true }));
-    return { title: section.title, context: (rows as Array<{ summary: string; material_json: unknown }>).flatMap((row) => [row.summary, ...contextFromMaterial(material(row.material_json))]) };
-  }
-  if (scopeId !== courseId) return null;
-  const courseRows = await read(client().from('courses').select('title, description').eq('id', courseId).maybeSingle<{ title: string; description: string }>());
-  if (!courseRows) return null;
-  const sections = await read(client().from('course_sections').select('id').eq('course_id', courseId));
-  const sectionIds = (sections as Array<{ id: string }>).map((section) => section.id);
-  const rows = sectionIds.length ? await read(client().from('lessons').select('title, summary, material_json').in('section_id', sectionIds).order('position', { ascending: true })) : [];
-  return { title: courseRows.title, context: [courseRows.description, ...(rows as Array<{ summary: string; material_json: unknown }>).flatMap((row) => [row.summary, ...contextFromMaterial(material(row.material_json))])] };
+export async function remoteCourseContext(userId: string, courseId: string, scope: 'lesson' | 'chapter' | 'course', scopeId: string) {
+  const value = await read(client().rpc('get_course_context_json', {
+    p_user_id: userId,
+    p_course_id: courseId,
+    p_scope: scope,
+    p_scope_id: scopeId,
+  }), 'operation') as { title?: unknown; description?: unknown; context?: unknown } | null;
+  if (!value || typeof value.title !== 'string' || !Array.isArray(value.context)) return null;
+  const contextRows = value.context as Array<{ summary?: unknown; material?: unknown }>;
+  return {
+    title: value.title,
+    context: [
+      ...(typeof value.description === 'string' ? [value.description] : []),
+      ...contextRows.flatMap((row) => [
+        ...(typeof row.summary === 'string' ? [row.summary] : []),
+        ...contextFromMaterial(material(row.material)),
+      ]),
+    ],
+  };
 }
 
 function contextFromMaterial(parsed: LessonMaterial | null) {
   if (!parsed) return [];
-  return [parsed.keyTakeaway, parsed.reflectivePrompt, ...parsed.article.sections.flatMap((section) => section.paragraphs), ...parsed.nodes.map((node) => node.heading)];
+  return [
+    parsed.keyTakeaway,
+    ...parsed.article.sections.flatMap((section) => [
+      ...section.paragraphs,
+      ...section.content.map((block) => block.type === 'paragraph'
+        ? block.text
+        : block.type === 'quote'
+          ? block.text
+          : block.type === 'table'
+            ? `${block.caption ?? 'Table'}: ${block.columns.join(' / ')}`
+            : block.type === 'equation'
+              ? `${block.caption ?? 'Equation'}: ${block.latex}`
+              : block.type === 'code'
+                ? `${block.caption ?? 'Code'}: ${block.code}`
+                : `${block.caption ?? 'Diagram'}: ${block.code}`),
+    ]),
+    ...parsed.nodes.map((node) => node.heading),
+  ]
+    .filter((value): value is string => Boolean(value));
 }
 
 export async function remoteAddEvent(userId: string, courseId: string, eventType: string, lessonId?: string, data?: unknown) {
@@ -235,42 +182,65 @@ export async function remoteAddEvent(userId: string, courseId: string, eventType
 }
 
 export async function remoteLessonRow(userId: string, courseId: string, lessonId: string) {
-  const course = await remoteCourseRow(userId, courseId);
+  const course = await remoteCourseWorkspace(userId, courseId, lessonId);
   if (!course) return null;
-  const row = await read(client().from('lessons').select('*').eq('id', lessonId).maybeSingle<RemoteLesson>());
-  if (!row) return null;
-  const section = await read(client().from('course_sections').select('id, title, course_id').eq('id', row.section_id).eq('course_id', courseId).maybeSingle<{ id: string; title: string; course_id: string }>());
-  return section ? { course, row, sectionTitle: section.title } : null;
+  const section = course.sections.find((candidate) => candidate.lessons.some((lesson) => lesson.id === lessonId));
+  const lesson = section?.lessons.find((candidate) => candidate.id === lessonId);
+  if (!section || !lesson) return null;
+  const row = {
+    id: lesson.id,
+    section_id: lesson.sectionId,
+    title: lesson.title,
+    summary: lesson.summary,
+    estimated_minutes: lesson.estimatedMinutes,
+    position: lesson.position,
+    material_json: lesson.material,
+    last_generated_at: null,
+    completed_at: lesson.completedAt,
+  };
+  return { course: { ...course, sections: course.sections }, row, sectionTitle: section.title };
+}
+
+export async function remoteOpenLesson(userId: string, courseId: string, lessonId: string) {
+  const value = await read(client().rpc('open_lesson_and_get_workspace', {
+    p_user_id: userId,
+    p_course_id: courseId,
+    p_lesson_id: lessonId,
+  }), 'operation');
+  return value ? CourseSchema.parse(value) : null;
 }
 
 export async function remoteAcquireLessonLock(userId: string, courseId: string, lessonId: string, lessonTitle: string, staleBefore: string) {
   const result = await read(client().rpc('claim_lesson_generation_lock', {
     p_user_id: userId, p_course_id: courseId, p_lesson_id: lessonId, p_lesson_title: lessonTitle, p_stale_before: staleBefore,
-  }));
+  }), 'operation');
   const payload = result as { acquired?: boolean; lock?: RemoteLock };
   return payload.acquired ? { acquired: true as const } : { acquired: false as const, lock: payload.lock };
 }
 
 export async function remoteReleaseLessonLock(userId: string, courseId: string, lessonId: string) {
-  await read(client().from('lesson_generation_locks').delete().eq('user_id', userId).eq('course_id', courseId).eq('lesson_id', lessonId));
+  await read(client().from('lesson_generation_locks').delete().eq('user_id', userId).eq('course_id', courseId).eq('lesson_id', lessonId), 'operation');
 }
 
 export async function remoteSaveLessonMaterial(lessonId: string, materialValue: LessonMaterial) {
-  await read(client().from('lessons').update({ material_json: materialValue, last_generated_at: nowIso() }).eq('id', lessonId).is('material_json', null));
+  await read(client().from('lessons').update({ material_json: materialValue, last_generated_at: nowIso() }).eq('id', lessonId).is('material_json', null), 'operation');
 }
 
 export async function remoteCompleteLesson(userId: string, courseId: string, lessonId: string) {
-  const row = await read(client().from('lessons').select('id, section_id, completed_at').eq('id', lessonId).maybeSingle<{ id: string; section_id: string; completed_at: string | null }>());
-  if (!row) return null;
-  const section = await read(client().from('course_sections').select('id').eq('id', row.section_id).eq('course_id', courseId).maybeSingle<{ id: string }>());
-  if (!section) return null;
-  if (!row.completed_at) {
-    const completedAt = nowIso();
-    await read(client().from('lessons').update({ completed_at: completedAt }).eq('id', lessonId));
-    await read(client().from('courses').update({ updated_at: completedAt }).eq('id', courseId).eq('user_id', userId));
-    await remoteAddEvent(userId, courseId, 'lesson_completed', lessonId);
+  const value = await read(client().rpc('complete_lesson_and_event', {
+    p_user_id: userId,
+    p_course_id: courseId,
+    p_lesson_id: lessonId,
+  }), 'operation') as {
+    ok?: boolean;
+    code?: string;
+    course?: unknown;
+  } | null;
+  if (!value?.ok) {
+    if (value?.code === 'archived') return { status: 'archived' as const };
+    return { status: 'not_found' as const };
   }
-  return remoteSerializeCourse(userId, courseId);
+  return { status: 'ok' as const, course: CourseSchema.parse(value.course) };
 }
 
 export async function remoteInsertQuiz(userId: string, courseId: string, quiz: Quiz) {

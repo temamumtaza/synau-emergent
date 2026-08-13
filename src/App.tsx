@@ -1,15 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
-import { api, clearToken, getToken } from './api';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { api, clearToken, CREDITS_CHANGED_EVENT, getToken } from './api';
 import { AuthScreen } from './components/AuthScreen';
-import { Dashboard } from './components/Dashboard';
-import { LibraryPage } from './components/LibraryPage';
 import { Icon } from './components/Icon';
-import { ProfilePage } from './components/ProfilePage';
-import { ProductProgressPage } from './components/ProductProgressPage';
-import { CreditsPage } from './components/CreditsPage';
-import { CourseWorkspace } from './components/CourseWorkspace';
 import type { User } from './types';
 import { signOutGoogle } from './supabase';
+
+const Dashboard = lazy(() => import('./components/Dashboard').then(({ Dashboard: component }) => ({ default: component })));
+const LibraryPage = lazy(() => import('./components/LibraryPage').then(({ LibraryPage: component }) => ({ default: component })));
+const ProfilePage = lazy(() => import('./components/ProfilePage').then(({ ProfilePage: component }) => ({ default: component })));
+const ProductProgressPage = lazy(() => import('./components/ProductProgressPage').then(({ ProductProgressPage: component }) => ({ default: component })));
+const CreditsPage = lazy(() => import('./components/CreditsPage').then(({ CreditsPage: component }) => ({ default: component })));
+const CourseWorkspace = lazy(() => import('./components/CourseWorkspace').then(({ CourseWorkspace: component }) => ({ default: component })));
 
 type AuthState =
   | { status: 'checking'; user: null }
@@ -73,15 +74,21 @@ function AppShell({ children, currentPath, onLogout, onNavigate, user }: AppShel
 
   useEffect(() => {
     let active = true;
-    api.credits()
+    const loadCredits = (force = false) => api.credits(force)
       .then(({ credits }) => {
         if (active) setCreditBalance(credits.balance);
       })
       .catch(() => {
         if (active) setCreditBalance(null);
       });
-    return () => { active = false; };
-  }, [currentPath]);
+    void loadCredits();
+    const handleCreditsChanged = () => { void loadCredits(); };
+    window.addEventListener(CREDITS_CHANGED_EVENT, handleCreditsChanged);
+    return () => {
+      active = false;
+      window.removeEventListener(CREDITS_CHANGED_EVENT, handleCreditsChanged);
+    };
+  }, [user.id]);
 
   useEffect(() => {
     if (!profileOpen) return;
@@ -174,6 +181,15 @@ function AppLoading() {
   );
 }
 
+function RouteLoading() {
+  return (
+    <section className="workspace-loading" aria-live="polite">
+      <span className="spinner" />
+      <p>Opening this space</p>
+    </section>
+  );
+}
+
 function NotFound({ onNavigate }: { onNavigate: (path: string) => void }) {
   return (
     <section className="page page--narrow empty-page">
@@ -256,7 +272,9 @@ export function App() {
 
   return (
     <AppShell currentPath={path} onLogout={handleLogout} onNavigate={navigate} user={auth.user}>
-      {page}
+      <Suspense fallback={<RouteLoading />}>
+        {page}
+      </Suspense>
     </AppShell>
   );
 }

@@ -54,7 +54,9 @@ try {
   await expect(page.locator('.lesson-reading__section').first()).toBeVisible({ timeout: 180_000 });
   await expect(page.locator('.lesson-citation').first()).toBeVisible({ timeout: 30_000 });
   await expect(page.locator('.lesson-references')).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('.practice-studio')).toBeVisible();
+  await expect(page.locator('.lesson-takeaway')).toContainText('Key takeaway');
+  await expect(page.locator('.lesson-node, .lesson-components, .data-lab, .practice-studio, .lesson-source-note, .reflection-card, .takeaway-card')).toHaveCount(0);
+  await expect(page.locator('.lesson-article').getByText('About this material', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: /^Mark complete$/i }).click();
   await expect(page.locator('.status-chip--complete')).toBeVisible({ timeout: 30_000 });
 
@@ -62,6 +64,10 @@ try {
   await expect(page.locator('.quiz-panel')).toBeVisible({ timeout: 180_000 });
   await expect(page.getByRole('button', { name: /submit answers/i })).toBeVisible({ timeout: 180_000 });
   const questions = page.locator('fieldset.quiz-question');
+  await expect(questions).toHaveCount(3);
+  await expect(page.locator('.quiz-question').nth(0)).toContainText('From the article');
+  await expect(page.locator('.quiz-question').nth(1)).toContainText('From the article');
+  await expect(page.locator('.quiz-question').nth(2)).toContainText('Challenge');
   for (let index = 0; index < await questions.count(); index += 1) {
     await questions.nth(index).locator('.quiz-option').first().click();
   }
