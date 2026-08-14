@@ -2,13 +2,14 @@ import { chromium } from 'playwright';
 import { expect } from 'playwright/test';
 
 const baseUrl = process.env.SYNAU_BASE_URL ?? 'http://127.0.0.1:8787';
+const token = process.env.SYNAU_TEST_TOKEN;
+if (!token) throw new Error('Set SYNAU_TEST_TOKEN to an active Supabase Auth access token.');
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 const createdCourseIds: string[] = [];
 
 async function createCourse(index: number) {
   const response = await page.evaluate(async (courseIndex) => {
-    const token = localStorage.getItem('synau.session');
     const stamp = `${Date.now()}-${courseIndex}`;
     const lesson = {
       id: `${stamp}-lesson`,
@@ -38,7 +39,7 @@ async function createCourse(index: number) {
     };
     const result = await fetch('/api/courses', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
     });
     return { status: result.status, body: await result.json() };
@@ -51,21 +52,22 @@ async function createCourse(index: number) {
 
 async function deleteFixtureCourses() {
   await page.evaluate(async (courseIds) => {
-    const token = localStorage.getItem('synau.session');
     await Promise.all(courseIds.map((courseId) => fetch(`/api/courses/${encodeURIComponent(courseId)}`, {
       method: 'DELETE',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
     })));
   }, createdCourseIds);
 }
 
 try {
+  await page.context().addCookies([{
+    name: 'synau_session',
+    value: token,
+    url: baseUrl,
+    httpOnly: true,
+    secure: baseUrl.startsWith('https://'),
+    sameSite: 'Lax',
+  }]);
   await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
-  await page.getByLabel('Email or username').fill('demo@synau.local');
-  await page.getByRole('button', { name: 'Send sign-in code' }).click();
-  await expect(page.getByText('Demo account code:')).toBeVisible();
-  await page.getByLabel('Verification code').fill('020599');
-  await page.getByRole('button', { name: 'Verify and continue' }).click();
   await expect(page.getByRole('heading', { name: 'What do you want to understand next?' })).toBeVisible();
 
   for (let index = 1; index <= 7; index += 1) await createCourse(index);

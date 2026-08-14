@@ -1,5 +1,5 @@
 import { getSupabaseAdmin } from './supabase.js';
-import { newId, nowIso } from './db.js';
+import { newId, nowIso } from './utils.js';
 import { recordSupabaseQuery } from './performance.js';
 import {
   CourseSchema,
@@ -155,6 +155,7 @@ function contextFromMaterial(parsed: LessonMaterial | null) {
   if (!parsed) return [];
   return [
     parsed.keyTakeaway,
+    ...markdownContext(parsed.article.markdown),
     ...parsed.article.sections.flatMap((section) => [
       ...section.paragraphs,
       ...section.content.map((block) => block.type === 'paragraph'
@@ -172,6 +173,24 @@ function contextFromMaterial(parsed: LessonMaterial | null) {
     ...parsed.nodes.map((node) => node.heading),
   ]
     .filter((value): value is string => Boolean(value));
+}
+
+function markdownContext(markdown: string) {
+  if (!markdown.trim()) return [];
+  return markdown
+    .replace(/```[\s\S]*?```/g, ' ')
+    .split(/\n\s*\n/)
+    .map((block) => block
+      .replace(/^#{1,6}\s+/gm, '')
+      .replace(/^[>*+-]\s+/gm, '')
+      .replace(/\[(.*?)\]\([^)]*\)/g, '$1')
+      .replace(/[|*_`]/g, ' ')
+      .replace(/\[\[[^\]]+\]\]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim())
+    .filter((block) => block.length >= 40)
+    .slice(0, 4)
+    .map((block) => block.length > 900 ? `${block.slice(0, 897).trimEnd()}...` : block);
 }
 
 export async function remoteAddEvent(userId: string, courseId: string, eventType: string, lessonId?: string, data?: unknown) {

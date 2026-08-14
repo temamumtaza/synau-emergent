@@ -2,24 +2,8 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 
 const baseUrl = process.env.SYNAU_BASE_URL ?? 'http://127.0.0.1:8787';
-let sessionToken = process.env.SYNAU_PERF_TOKEN;
-
-if (!sessionToken) {
-  const email = process.env.SYNAU_PERF_REMOTE_EMAIL ?? 'demo@synau.local';
-  const { getSupabaseAdmin } = await import('../server/supabase.js');
-  const profile = (await getSupabaseAdmin().from('users').select('id').eq('email', email).maybeSingle()).data as { id: string } | null;
-  if (!profile) throw new Error(`Remote performance user not found: ${email}`);
-  const session = (await getSupabaseAdmin()
-    .from('sessions')
-    .select('token')
-    .eq('user_id', profile.id)
-    .gt('expires_at', new Date().toISOString())
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()).data as { token: string } | null;
-  if (!session) throw new Error(`No active remote session found for ${email}. Set SYNAU_PERF_TOKEN.`);
-  sessionToken = session.token;
-}
+const sessionToken = process.env.SYNAU_PERF_TOKEN;
+if (!sessionToken) throw new Error('Set SYNAU_PERF_TOKEN to an active Supabase Auth access token. Do not read application session rows from Supabase.');
 
 const headers = {
   authorization: `Bearer ${sessionToken}`,
@@ -51,7 +35,7 @@ async function call<T>(name: string, path: string, init: RequestInit = {}) {
   });
   const durationMs = performance.now() - startedAt;
   const serverTiming = response.headers.get('server-timing') ?? '';
-  const body = response.status === 204 ? null : await response.json() as T;
+  const body = (response.status === 204 ? null : await response.json()) as T;
   probes.push({
     name,
     path,

@@ -2,6 +2,8 @@ import { chromium } from 'playwright';
 import { expect } from 'playwright/test';
 
 const appUrl = process.env.SYNAU_BASE_URL ?? 'http://127.0.0.1:8787';
+const token = process.env.SYNAU_TEST_TOKEN;
+if (!token) throw new Error('Set SYNAU_TEST_TOKEN to an active Supabase Auth access token.');
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
 const errors: string[] = [];
@@ -9,11 +11,15 @@ page.on('pageerror', (error) => errors.push(`page: ${error.message}`));
 page.on('response', (response) => { if (response.status() >= 500) errors.push(`http ${response.status()}: ${response.url()}`); });
 
 try {
+  await page.context().addCookies([{
+    name: 'synau_session',
+    value: token,
+    url: appUrl,
+    httpOnly: true,
+    secure: appUrl.startsWith('https://'),
+    sameSite: 'Lax',
+  }]);
   await page.goto(appUrl, { waitUntil: 'domcontentloaded' });
-  await page.locator('input[placeholder="you@example.com or username"]').fill('demo@synau.local');
-  await page.getByRole('button', { name: /send sign-in code/i }).click();
-  await page.getByLabel('Verification code').fill('020599');
-  await page.getByRole('button', { name: /verify and continue/i }).click();
   await expect(page.getByText('What do you want to understand next?')).toBeVisible();
   await page.goto(`${appUrl}/credits`, { waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible({ timeout: 15_000 });

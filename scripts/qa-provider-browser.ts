@@ -1,10 +1,7 @@
 import { chromium } from 'playwright';
 import { expect } from 'playwright/test';
-import { db } from '../server/db.js';
-
-const email = process.env.SYNAU_TEST_EMAIL;
-const authCode = process.env.SYNAU_TEST_CODE;
-if (!email || !authCode) throw new Error('Set SYNAU_TEST_EMAIL and SYNAU_TEST_CODE.');
+const token = process.env.SYNAU_TEST_TOKEN;
+if (!token) throw new Error('Set SYNAU_TEST_TOKEN to an active Supabase Auth access token.');
 
 const baseUrl = process.env.SYNAU_BASE_URL ?? 'http://127.0.0.1:8787';
 const browser = await chromium.launch({ headless: true });
@@ -22,16 +19,19 @@ page.on('pageerror', (error) => recordPageError('page', error));
 page.on('response', (response) => { if (response.status() >= 500) errors.push(`http ${response.status()}: ${response.url()}`); });
 
 try {
+  await context.addCookies([{
+    name: 'synau_session',
+    value: token,
+    url: baseUrl,
+    httpOnly: true,
+    secure: baseUrl.startsWith('https://'),
+    sameSite: 'Lax',
+  }]);
   await page.goto(baseUrl, { waitUntil: 'networkidle' });
-  await page.getByLabel('Email or username').fill(email);
-  await page.getByRole('button', { name: /send sign-in code/i }).click();
-  await expect(page.getByLabel('Verification code')).toBeVisible();
-  await page.getByLabel('Verification code').fill(authCode);
-  await page.getByRole('button', { name: /verify and continue/i }).click();
   await expect(page.getByText('What do you want to understand next?')).toBeVisible();
 
   await page.getByLabel('I want to learn').fill('Decision making with data');
-  await page.getByRole('button', { name: /preview roadmap/i }).click();
+  await page.getByRole('button', { name: /generate course/i }).click();
   await expect(page.getByText('Roadmap preview')).toBeVisible({ timeout: 180_000 });
   await page.locator('.approval-check input').check();
   await page.getByRole('button', { name: /approve and create/i }).click();
@@ -45,13 +45,16 @@ try {
   secondaryPage.on('response', (response: any) => { if (response.status() >= 500) errors.push(`secondary http ${response.status()}: ${response.url()}`); });
   await secondaryPage.goto(page.url(), { waitUntil: 'networkidle' });
   await expect(secondaryPage.getByText('Generate this lesson on demand.')).toBeVisible({ timeout: 30_000 });
-  await page.getByRole('button', { name: 'Open lesson' }).click();
+  await page.locator('.course-rail .rail-lessons > button').first().click();
   await expect(page.getByText('Generating this lesson')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('.lesson-article--streaming')).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('.lesson-article--streaming .lesson-markdown')).toBeVisible({ timeout: 60_000 });
+  const streamingArticleObserved = true;
   await secondaryPage.locator('.course-rail .rail-lessons > button').nth(1).click();
   await expect(secondaryPage.getByText(/another lesson is currently being generated/i)).toBeVisible({ timeout: 30_000 });
   await secondaryPage.close();
   secondaryPage = null;
-  await expect(page.locator('.lesson-reading__section').first()).toBeVisible({ timeout: 180_000 });
+  await expect(page.locator('.lesson-markdown, .lesson-reading__section').first()).toBeVisible({ timeout: 180_000 });
   await expect(page.locator('.lesson-citation').first()).toBeVisible({ timeout: 30_000 });
   await expect(page.locator('.lesson-references')).toBeVisible({ timeout: 30_000 });
   await expect(page.locator('.lesson-takeaway')).toContainText('Key takeaway');
@@ -75,7 +78,7 @@ try {
   await expect(page.locator('.quiz-score')).toBeVisible({ timeout: 60_000 });
   if (errors.length > 0) throw new Error(errors.join('\n'));
   await page.screenshot({ path: 'quality/tema-provider-e2e.png', fullPage: true });
-  console.log(JSON.stringify({ ok: true, result: 'live provider browser workflow passed', screenshot: 'quality/tema-provider-e2e.png' }, null, 2));
+  console.log(JSON.stringify({ ok: true, result: 'live provider browser workflow passed', streamingArticleObserved, screenshot: 'quality/tema-provider-e2e.png' }, null, 2));
 } catch (error) {
   await page.screenshot({ path: 'quality/tema-provider-e2e-failure.png', fullPage: true }).catch(() => undefined);
   let currentUrl = '';
@@ -88,8 +91,10 @@ try {
   await secondaryPage?.close().catch(() => undefined);
   await browser.close();
   if (createdCourseId) {
-    const result = db.prepare('DELETE FROM courses WHERE id = ?').run(createdCourseId);
-    console.error(`Browser QA cleanup: removed ${result.changes} temporary course row.`);
+    await fetch(`${baseUrl}/api/courses/${encodeURIComponent(createdCourseId)}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    }).catch(() => undefined);
+    console.error('Browser QA cleanup: requested Supabase course deletion.');
   }
-  if (db.open) db.close();
 }

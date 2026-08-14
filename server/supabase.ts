@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').trim().replace(/\/$/, '');
@@ -25,6 +26,10 @@ export function getSupabaseAdmin() {
   return adminClient;
 }
 
-export function isSupabaseStorage() {
-  return (process.env.SYNAU_STORAGE ?? 'sqlite').trim().toLowerCase() === 'supabase';
+export function assertSupabaseRuntime() {
+  const configuredStorage = (process.env.SYNAU_STORAGE ?? 'supabase').trim().toLowerCase();
+  if (configuredStorage !== 'supabase') {
+    throw new Error('Synau uses Supabase storage exclusively; remove the legacy storage setting or set SYNAU_STORAGE=supabase.');
+  }
+  getSupabaseAdmin();
 }

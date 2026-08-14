@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { GoogleAuthRequest } from '../shared/schemas.js';
-import { newId, nowIso } from './db.js';
+import { newId, nowIso } from './utils.js';
 import { getSupabaseAdmin } from './supabase.js';
 import { recordSupabaseQuery } from './performance.js';
 import type { UserRecord } from './auth.js';
@@ -26,6 +26,11 @@ type GoogleAuthUser = {
 const verifiedTokenCache = new Map<string, { expiresAt: number; user: UserRecord | undefined }>();
 const verifiedTokenFlights = new Map<string, Promise<UserRecord | undefined>>();
 const verifiedTokenCacheMs = Math.max(0, Math.min(30_000, Number(process.env.SYNAU_AUTH_CACHE_MS ?? 5_000)));
+const sessionTtlDays = Math.max(1, Math.min(30, Number(process.env.SYNAU_SESSION_TTL_DAYS ?? 30)));
+
+function sessionTokenHash(token: string) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
 
 async function read<T>(query: PromiseLike<{ data: T; error: { message: string } | null }>) {
   const startedAt = performance.now();
@@ -157,14 +162,14 @@ export async function completeSupabaseGoogleAuth(input: GoogleAuthRequest) {
   const { user: authUser, email } = await verifiedGoogleUser(input.accessToken);
   const existingByAuthId = await profileByAuthId(authUser.id);
   if (existingByAuthId) {
-    return { status: 'authenticated' as const, token: input.accessToken, user: profileUser(existingByAuthId), created: false };
+    return { status: 'authenticated' as const, user: profileUser(existingByAuthId), created: false };
   }
 
   // A migrated Synau account can be linked to Google by its verified email,
   // without asking the learner to recreate their profile.
   const linkedProfile = await linkExistingEmailProfile(authUser, email);
   if (linkedProfile) {
-    return { status: 'authenticated' as const, token: input.accessToken, user: linkedProfile, created: false };
+    return { status: 'authenticated' as const, user: linkedProfile, created: false };
   }
 
   const suggestion = googleProfileSuggestion(authUser, email);
@@ -191,7 +196,18 @@ export async function completeSupabaseGoogleAuth(input: GoogleAuthRequest) {
     name: displayName(firstName, lastName),
   }).select('*').single<RemoteProfile>());
   if (!created) throw new AuthFlowError('Could not create your Synau profile. Please try again.', 503, 'profile_creation_failed');
-  return { status: 'authenticated' as const, token: input.accessToken, user: profileUser(created), created: true };
+  return { status: 'authenticated' as const, user: profileUser(created), created: true };
+}
+
+export async function remoteCreateSession(userId: string) {
+  const token = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + sessionTtlDays * 24 * 60 * 60 * 1_000).toISOString();
+  await read(getSupabaseAdmin().from('sessions').insert({
+    token: sessionTokenHash(token),
+    user_id: userId,
+    expires_at: expiresAt,
+  }));
+  return { token, expiresAt };
 }
 
 export async function remoteUserForToken(token: string) {
@@ -225,7 +241,7 @@ async function remoteUserForTokenUncached(token: string, cacheKey: string) {
     const session = await read(getSupabaseAdmin()
       .from('sessions')
       .select('user_id, users(id, auth_user_id, email, first_name, last_name, username, name)')
-      .eq('token', token)
+      .eq('token', sessionTokenHash(token))
       .gt('expires_at', nowIso())
       .maybeSingle<{ user_id: string; users: RemoteProfile | null }>()).catch(() => null);
     user = session?.users ? profileUser(session.users) : undefined;
@@ -238,7 +254,7 @@ async function remoteUserForTokenUncached(token: string, cacheKey: string) {
 }
 
 export async function remoteRevokeSession(token: string) {
-  await read(getSupabaseAdmin().from('sessions').delete().eq('token', token));
+  await read(getSupabaseAdmin().from('sessions').delete().eq('token', sessionTokenHash(token)));
   const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
   verifiedTokenCache.delete(cacheKey);
   verifiedTokenFlights.delete(cacheKey);

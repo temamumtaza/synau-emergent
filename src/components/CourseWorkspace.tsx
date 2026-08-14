@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
-import { api, ApiError } from '../api';
+import { marked } from 'marked';
+import { api, ApiError, type LessonStreamStatus } from '../api';
 import type { Course, CourseLesson, CourseSection, LessonArticleBlock, LessonMaterial, LessonNode, LessonWithSection, QuizScope } from '../types';
 import { CodeBlock, HighlightedCode } from './CodeBlock';
 import { Icon } from './Icon';
@@ -16,34 +17,71 @@ function flattenCourse(course: Course): LessonWithSection[] {
   return course.sections.flatMap((section) => section.lessons.map((lesson) => ({ lesson, section })));
 }
 
-function LessonLoading({ lesson }: { lesson: CourseLesson }) {
+function preserveLessonMaterial(nextCourse: Course, currentCourse: Course | null, lessonId: string) {
+  const currentLesson = currentCourse
+    ? flattenCourse(currentCourse).find(({ lesson }) => lesson.id === lessonId)?.lesson
+    : undefined;
+  const nextLesson = flattenCourse(nextCourse).find(({ lesson }) => lesson.id === lessonId)?.lesson;
+  if (!currentLesson?.material || nextLesson?.material) return nextCourse;
+  return {
+    ...nextCourse,
+    sections: nextCourse.sections.map((section) => ({
+      ...section,
+      lessons: section.lessons.map((lesson) => lesson.id === lessonId
+        ? { ...lesson, material: currentLesson.material }
+        : lesson),
+    })),
+  };
+}
+
+type LessonStreamState = {
+  markdown: string;
+  status: LessonStreamStatus;
+  startedAt: number;
+  finished?: boolean;
+};
+
+function lessonStatusHeading(stage: string) {
+  if (stage === 'connecting') return 'Connecting to the model';
+  if (stage === 'writing') return 'Writing the article';
+  if (stage === 'validating') return 'Checking the finished lesson';
+  return 'Preparing your lesson';
+}
+
+function StreamingLessonArticle({ lesson, stream }: { lesson: CourseLesson; stream?: LessonStreamState }) {
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  useEffect(() => {
+    const startedAt = stream?.startedAt ?? Date.now();
+    const update = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    update();
+    const timer = window.setInterval(update, 1_000);
+    return () => window.clearInterval(timer);
+  }, [stream?.startedAt]);
+
+  const finished = stream?.finished === true;
+  const status = stream?.status ?? { stage: 'connecting', message: 'Preparing the lesson stream.' };
   return (
-    <div className="lesson-loading" aria-live="polite">
-      <div className="lesson-loading__status">
-        <span className="spinner" aria-hidden="true" />
+    <article className="lesson-article lesson-article--streaming" aria-busy={!finished}>
+      <div className="lesson-stream-status" role="status">
+        {!finished && <span className="spinner" aria-hidden="true" />}
         <div>
-          <p className="eyebrow">Generating this lesson</p>
-          <h2>Shaping a focused subchapter</h2>
-          <p>Synau is using the roadmap and earlier course context to avoid unnecessary repetition.</p>
+          <p className="eyebrow">{finished ? 'Lesson ready' : 'Generating this lesson'}</p>
+          <h2>{finished ? 'Your lesson is ready' : lessonStatusHeading(status.stage)}</h2>
+          <p>{status.message}</p>
         </div>
+        <span className="lesson-stream-status__time">{elapsedSeconds}s</span>
       </div>
-      <div className="lesson-loading__steps" aria-hidden="true">
-        <span className="is-active"><i />Reading the lesson brief</span>
-        <span><i />Building the explanation</span>
-        <span><i />Polishing the article and sources</span>
-      </div>
-      <div className="lesson-skeleton" aria-hidden="true">
-        <span className="skeleton skeleton--title" />
-        <span className="skeleton skeleton--line" />
-        <span className="skeleton skeleton--line" />
-        <span className="skeleton skeleton--line skeleton--short" />
-        <div />
-        <span className="skeleton skeleton--title" />
-        <span className="skeleton skeleton--line" />
-        <span className="skeleton skeleton--line" />
-      </div>
-      <p className="lesson-loading__lesson">Preparing “{lesson.title}”</p>
-    </div>
+      {stream?.markdown.trim()
+        ? <MarkdownArticleBody markdown={stream.markdown} sources={[]} />
+        : <div className="lesson-stream-empty" aria-hidden="true">
+            <span className="skeleton skeleton--title" />
+            <span className="skeleton skeleton--line" />
+            <span className="skeleton skeleton--line" />
+            <span className="skeleton skeleton--line skeleton--short" />
+          </div>}
+      <p className="lesson-streaming__lesson">{finished ? `Reading “${lesson.title}”` : `Preparing “${lesson.title}”`}</p>
+    </article>
   );
 }
 
@@ -115,11 +153,13 @@ function CitationText({ text, sources }: { text: string; sources: LessonMaterial
     if (index % 2 === 0) return part;
     const source = sources.find((candidate) => candidate.id === part);
     if (!source) return part;
+    const safeHref = safeMarkdownUrl(source.url);
+    if (!safeHref) return `[${sourceIndex.get(source.id)}]`;
     return (
       <a
         aria-label={`Reference ${sourceIndex.get(source.id)}: ${source.title}`}
         className="lesson-citation"
-        href={source.url}
+        href={safeHref}
         key={`${source.id}-${index}`}
         rel="noreferrer"
         target="_blank"
@@ -128,6 +168,170 @@ function CitationText({ text, sources }: { text: string; sources: LessonMaterial
       </a>
     );
   })}</>;
+}
+
+const markdownAllowedTags = new Set([
+  'A', 'B', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HR', 'IMG', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TH', 'THEAD',
+  'TR', 'UL',
+]);
+
+function safeMarkdownUrl(value: string, image = false) {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('#')) return trimmed;
+  try {
+    const parsed = new URL(trimmed, window.location.href);
+    const allowed = image ? ['http:', 'https:'] : ['http:', 'https:', 'mailto:'];
+    return allowed.includes(parsed.protocol) ? parsed.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
+function sanitizeMarkdownHtml(html: string) {
+  const documentRoot = new DOMParser().parseFromString(html, 'text/html');
+  for (const element of [...documentRoot.body.querySelectorAll('*')]) {
+    if (!markdownAllowedTags.has(element.tagName)) {
+      element.replaceWith(documentRoot.createTextNode(element.textContent ?? ''));
+      continue;
+    }
+    for (const attribute of [...element.attributes]) {
+      if (!['alt', 'class', 'href', 'src', 'title'].includes(attribute.name.toLocaleLowerCase())) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+    if (element.tagName === 'A') {
+      const href = element.getAttribute('href') ?? '';
+      const safeHref = safeMarkdownUrl(href);
+      if (safeHref) {
+        element.setAttribute('href', safeHref);
+        element.setAttribute('target', '_blank');
+        element.setAttribute('rel', 'noreferrer');
+      } else {
+        element.removeAttribute('href');
+      }
+    }
+    if (element.tagName === 'IMG') {
+      const src = element.getAttribute('src') ?? '';
+      const safeSrc = safeMarkdownUrl(src, true);
+      if (safeSrc) {
+        element.setAttribute('src', safeSrc);
+        element.setAttribute('loading', 'lazy');
+        element.setAttribute('referrerpolicy', 'no-referrer');
+      } else {
+        element.replaceWith(documentRoot.createTextNode(element.getAttribute('alt') ?? ''));
+      }
+    }
+  }
+  return documentRoot.body.innerHTML;
+}
+
+function enhanceMarkdownCitations(root: HTMLElement, sources: LessonMaterial['sources']) {
+  const sourceIndex = new Map(sources.map((source, index) => [source.id, index + 1]));
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  let current: Node | null;
+  while ((current = walker.nextNode())) {
+    const parent = current.parentElement;
+    if (parent && !parent.closest('pre, code, a') && /\[\[[^\]]+\]\]/.test(current.textContent ?? '')) {
+      textNodes.push(current as Text);
+    }
+  }
+  for (const node of textNodes) {
+    const text = node.textContent ?? '';
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    for (const match of text.matchAll(/\[\[([^\]]+)\]\]/g)) {
+      const sourceId = match[1];
+      const start = match.index ?? 0;
+      fragment.append(document.createTextNode(text.slice(cursor, start)));
+      const index = sourceIndex.get(sourceId);
+      const source = sources.find((candidate) => candidate.id === sourceId);
+      if (index && source) {
+        const safeHref = safeMarkdownUrl(source.url);
+        if (!safeHref) {
+          fragment.append(document.createTextNode(match[0]));
+          cursor = start + match[0].length;
+          continue;
+        }
+        const anchor = document.createElement('a');
+        anchor.className = 'lesson-citation';
+        anchor.href = safeHref;
+        anchor.target = '_blank';
+        anchor.rel = 'noreferrer';
+        anchor.textContent = `[${index}]`;
+        anchor.setAttribute('aria-label', `Reference ${index}: ${source.title}`);
+        fragment.append(anchor);
+      } else {
+        fragment.append(document.createTextNode(match[0]));
+      }
+      cursor = start + match[0].length;
+    }
+    fragment.append(document.createTextNode(text.slice(cursor)));
+    node.replaceWith(fragment);
+  }
+}
+
+async function enhanceMarkdownMermaid(root: HTMLElement, cancelled: () => boolean) {
+  const blocks = [...root.querySelectorAll('pre > code.language-mermaid, pre > code.lang-mermaid')];
+  if (blocks.length === 0) return;
+  const { default: mermaid } = await import('mermaid');
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: 'base',
+    themeVariables: {
+      background: '#fbfbf8',
+      primaryColor: '#f1f1ec',
+      primaryTextColor: '#171716',
+      primaryBorderColor: '#9c9c94',
+      lineColor: '#676761',
+      secondaryColor: '#f7f7f3',
+      tertiaryColor: '#ffffff',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+    },
+  });
+  for (const [index, codeElement] of blocks.entries()) {
+    if (cancelled()) return;
+    const code = codeElement.textContent ?? '';
+    try {
+      const result = await mermaid.render(`synau-markdown-mermaid-${Date.now()}-${index}`, code);
+      if (cancelled()) return;
+      const figure = document.createElement('figure');
+      figure.className = 'lesson-rich-block lesson-rich-block--mermaid';
+      const host = document.createElement('div');
+      host.setAttribute('aria-label', 'Lesson diagram');
+      host.innerHTML = result.svg;
+      figure.append(host);
+      codeElement.parentElement?.replaceWith(figure);
+    } catch {
+      // Keep the original fenced code visible when a provider emits invalid Mermaid.
+    }
+  }
+}
+
+function MarkdownArticleBody({ markdown, sources }: { markdown: string; sources: LessonMaterial['sources'] }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const html = useMemo(() => {
+    const renderer = new marked.Renderer();
+    renderer.html = () => '';
+    return sanitizeMarkdownHtml(String(marked.parse(markdown, { gfm: true, renderer })));
+  }, [markdown]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return undefined;
+    let cancelled = false;
+    container.innerHTML = html;
+    enhanceMarkdownCitations(container, sources);
+    void enhanceMarkdownMermaid(container, () => cancelled);
+    return () => {
+      cancelled = true;
+      container.innerHTML = '';
+    };
+  }, [html, sources]);
+
+  return <div className="lesson-markdown" ref={containerRef} />;
 }
 
 function EquationBlock({ block }: { block: Extract<LessonArticleBlock, { type: 'equation' }> }) {
@@ -226,6 +430,9 @@ function ArticleBlock({ block, sources }: { block: LessonArticleBlock; sources: 
 }
 
 function ArticleBody({ article, sources }: Pick<LessonMaterial, 'article' | 'sources'>) {
+  if (article.markdown.trim()) {
+    return <MarkdownArticleBody markdown={article.markdown} sources={sources} />;
+  }
   return (
     <div className="lesson-reading">
       {article.sections.map((section) => (
@@ -248,7 +455,9 @@ function LessonReferences({ sources }: { sources: LessonMaterial['sources'] }) {
       <ol>
         {sources.map((source) => (
           <li key={source.id}>
-            <a href={source.url} rel="noreferrer" target="_blank">{source.title}</a>
+            {safeMarkdownUrl(source.url)
+              ? <a href={safeMarkdownUrl(source.url)} rel="noreferrer" target="_blank">{source.title}</a>
+              : <span>{source.title}</span>}
             <span>{source.publisher} · {source.kind}</span>
           </li>
         ))}
@@ -323,7 +532,7 @@ function LessonContent({
         <p>{material.overview}</p>
       </div>
 
-      {material.article.sections.length > 0
+      {material.article.markdown.trim() || material.article.sections.length > 0
         ? <ArticleBody article={material.article} sources={material.sources} />
         : <LegacyLessonBody blocks={material.blocks} nodes={material.nodes} />}
 
@@ -361,6 +570,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
   const [openingLessons, setOpeningLessons] = useState<Set<string>>(() => new Set());
   const [lessonErrors, setLessonErrors] = useState<Record<string, string>>({});
   const [lessonGenerationBusy, setLessonGenerationBusy] = useState<Record<string, boolean>>({});
+  const [lessonStreams, setLessonStreams] = useState<Record<string, LessonStreamState>>({});
   const activeLessonGenerationRef = useRef<string | null>(null);
   const [completingLessonId, setCompletingLessonId] = useState('');
   const [completionError, setCompletionError] = useState('');
@@ -381,12 +591,52 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
     }
     if (activeLessonId === lessonId) return;
     activeLessonGenerationRef.current = lessonId;
+    const startedAt = Date.now();
     setOpeningLessons((current) => new Set(current).add(lessonId));
     setLessonErrors((current) => ({ ...current, [lessonId]: '' }));
     setLessonGenerationBusy((current) => ({ ...current, [lessonId]: false }));
+    setLessonStreams((current) => ({
+      ...current,
+      [lessonId]: {
+        markdown: '',
+        startedAt,
+        status: { stage: 'connecting', message: 'Preparing the lesson stream.' },
+      },
+    }));
+    let keepFinalStream = false;
     try {
-      const { course: updatedCourse } = await api.openLesson(courseId, lessonId);
+      const { course: updatedCourse } = await api.openLessonStream(courseId, lessonId, {
+        onStatus: (status) => setLessonStreams((current) => {
+          const existing = current[lessonId];
+          if (!existing) return current;
+          return { ...current, [lessonId]: { ...existing, status } };
+        }),
+        onMarkdown: (markdown, append) => setLessonStreams((current) => {
+          const existing = current[lessonId];
+          if (!existing) return current;
+          return {
+            ...current,
+            [lessonId]: { ...existing, markdown: append ? `${existing.markdown}${markdown}` : markdown },
+          };
+        }),
+      });
       setCourse(updatedCourse);
+      const updatedLesson = flattenCourse(updatedCourse).find(({ lesson }) => lesson.id === lessonId)?.lesson;
+      keepFinalStream = !updatedLesson?.material;
+      if (keepFinalStream) {
+        setLessonStreams((current) => {
+          const existing = current[lessonId];
+          if (!existing) return current;
+          return {
+            ...current,
+            [lessonId]: {
+              ...existing,
+              finished: true,
+              status: { stage: 'validating', message: 'The lesson is ready to read.' },
+            },
+          };
+        });
+      }
     } catch (error) {
       setLessonErrors((current) => ({
         ...current,
@@ -403,6 +653,13 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
         next.delete(lessonId);
         return next;
       });
+      if (!keepFinalStream) {
+        setLessonStreams((current) => {
+          const next = { ...current };
+          delete next[lessonId];
+          return next;
+        });
+      }
     }
   }, [courseId]);
 
@@ -433,17 +690,41 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
   const selectedIndex = lessons.findIndex(({ lesson }) => lesson.id === selectedLessonId);
   const selectedItem = selectedIndex >= 0 ? lessons[selectedIndex] : null;
 
+  useEffect(() => {
+    const lesson = selectedItem?.lesson;
+    if (!lesson || lesson.material) return;
+    if (openingLessons.has(lesson.id)) return;
+    if (activeLessonGenerationRef.current === lesson.id) return;
+    // A completed stream can temporarily be the only readable copy while
+    // the final course response is being reconciled. Never start a duplicate
+    // provider request in that state.
+    if (lessonStreams[lesson.id]?.finished) return;
+
+    const error = lessonErrors[lesson.id];
+    const waitingForAnotherLesson = Boolean(lessonGenerationBusy[lesson.id])
+      && activeLessonGenerationRef.current === null;
+    // Provider failures stay visible instead of creating an endless retry
+    // loop. A concurrency error is safe to retry once the active generation
+    // has finished, so it is the one error that remains auto-retryable.
+    if (error && !waitingForAnotherLesson) return;
+    void openLesson(lesson.id);
+  }, [selectedItem, openingLessons, lessonStreams, lessonErrors, lessonGenerationBusy, openLesson]);
+
   const selectLesson = useCallback((lessonId: string) => {
     setSelectedLessonId(lessonId);
     setCompletionError('');
-    const item = lessons.find(({ lesson }) => lesson.id === lessonId);
-    if (item && !item.lesson.material && !openingLessons.has(lessonId)) {
-      void openLesson(lessonId);
-    }
+    // Selecting a lesson is the retry intent now that generation is automatic;
+    // there is no separate manual generation or retry action in the UI.
+    setLessonErrors((current) => current[lessonId]
+      ? { ...current, [lessonId]: '' }
+      : current);
+    setLessonGenerationBusy((current) => current[lessonId]
+      ? { ...current, [lessonId]: false }
+      : current);
     if (window.innerWidth < 900) {
       window.setTimeout(() => lessonTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 20);
     }
-  }, [lessons, openingLessons, openLesson]);
+  }, []);
 
   const completeSelectedLesson = useCallback(async () => {
     if (!selectedItem || selectedItem.lesson.completedAt || completionInFlightRef.current) return;
@@ -452,7 +733,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
     setCompletionError('');
     try {
       const { course: updatedCourse } = await api.completeLesson(courseId, selectedItem.lesson.id);
-      setCourse(updatedCourse);
+      setCourse((currentCourse) => preserveLessonMaterial(updatedCourse, currentCourse, selectedItem.lesson.id));
     } catch (error) {
       setCompletionError(error instanceof Error ? error.message : 'Could not save your progress.');
     } finally {
@@ -508,6 +789,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
   const lessonOpening = selectedLesson ? openingLessons.has(selectedLesson.id) : false;
   const lessonError = selectedLesson ? lessonErrors[selectedLesson.id] : '';
   const lessonIsBusy = selectedLesson ? Boolean(lessonGenerationBusy[selectedLesson.id]) : false;
+  const lessonStream = selectedLesson ? lessonStreams[selectedLesson.id] : undefined;
 
   return (
     <div className="course-workspace">
@@ -555,7 +837,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
                 </div>
               </header>
 
-              {lessonOpening && !selectedLesson.material && <LessonLoading lesson={selectedLesson} />}
+              {!selectedLesson.material && !lessonError && <StreamingLessonArticle lesson={selectedLesson} stream={lessonStream} />}
 
               {lessonError && !lessonOpening && !selectedLesson.material && (
                 <div className="lesson-generation-error" role="alert">
@@ -563,20 +845,7 @@ export function CourseWorkspace({ courseId, onBack }: CourseWorkspaceProps) {
                   <div>
                     <p className="eyebrow">{lessonIsBusy ? 'Another lesson is generating' : 'Generation paused'}</p>
                     <h2>{lessonIsBusy ? 'Synau is preparing another subchapter.' : 'This lesson could not be prepared.'}</h2>
-                    <p>{lessonError}</p>
-                    <button className="button button--primary" onClick={() => void openLesson(selectedLesson.id)} type="button">{lessonIsBusy ? 'Check again when it finishes' : 'Try generating again'}</button>
-                  </div>
-                </div>
-              )}
-
-              {!lessonOpening && !lessonError && !selectedLesson.material && (
-                <div className="lesson-generation-error">
-                  <span><Icon name="book" size={22} /></span>
-                  <div>
-                    <p className="eyebrow">Ready when you are</p>
-                    <h2>Generate this lesson on demand.</h2>
-                    <p>Synau creates material only when a subchapter is opened.</p>
-                    <button className="button button--primary" onClick={() => void openLesson(selectedLesson.id)} type="button">Open lesson</button>
+                    <p>{lessonIsBusy ? `${lessonError} Synau will load this subchapter automatically when the other generation finishes.` : lessonError}</p>
                   </div>
                 </div>
               )}

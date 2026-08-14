@@ -1,5 +1,4 @@
 import type {
-  AuthCodeResponse,
   Course,
   CourseLesson,
   CourseSection,
@@ -20,7 +19,6 @@ import type {
 } from '../shared/schemas';
 
 export type {
-  AuthCodeResponse,
   Course,
   CourseLesson,
   CourseSection,
@@ -38,11 +36,6 @@ export type {
   QuizScope,
   Roadmap,
   User,
-};
-
-export type AuthResponse = {
-  token: string;
-  user: User;
 };
 
 export type QuizResult = {

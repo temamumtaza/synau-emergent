@@ -2,6 +2,8 @@ import { chromium } from 'playwright';
 import { expect } from 'playwright/test';
 
 const baseUrl = process.env.SYNAU_BASE_URL ?? 'http://127.0.0.1:8787';
+const token = process.env.SYNAU_TEST_TOKEN;
+if (!token) throw new Error('Set SYNAU_TEST_TOKEN to an active Supabase Auth access token.');
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 const evidence: string[] = [];
@@ -10,25 +12,20 @@ try {
   // Vite keeps its HMR client connection open in development, so networkidle
   // is not a stable readiness signal. The assertions below provide the real
   // readiness gates for the learner workflow.
+  await page.context().addCookies([{
+    name: 'synau_session',
+    value: token,
+    url: baseUrl,
+    httpOnly: true,
+    secure: baseUrl.startsWith('https://'),
+    sameSite: 'Lax',
+  }]);
   await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
-  await page.getByRole('tab', { name: 'Sign up' }).click();
-  await expect(page.getByLabel('First Name')).toBeVisible();
-  await expect(page.getByLabel('Last Name')).toBeVisible();
-  await expect(page.getByLabel('Username')).toBeVisible();
-  await expect(page.getByLabel('Email address')).toBeVisible();
-  evidence.push('passwordless-signup-fields');
-  await page.getByRole('tab', { name: 'Sign in' }).click();
-  await page.getByLabel('Email or username').fill('demo@synau.local');
-  await page.getByRole('button', { name: /send sign-in code/i }).click();
-  await expect(page.getByLabel('Verification code')).toBeVisible();
-  await page.screenshot({ path: 'quality/auth-otp-final.png', fullPage: true });
-  await page.getByLabel('Verification code').fill('020599');
-  await page.getByRole('button', { name: /verify and continue/i }).click();
   await expect(page.getByText('What do you want to understand next?')).toBeVisible();
-  evidence.push('login');
+  evidence.push('google-authenticated-session');
 
   await page.getByLabel('I want to learn').fill('Decision making with data');
-  await page.getByRole('button', { name: /preview roadmap/i }).click();
+  await page.getByRole('button', { name: /generate course/i }).click();
   await expect(page.getByText('Roadmap preview')).toBeVisible();
   const firstRoadmapSection = page.locator('.roadmap-dialog .roadmap-section').first();
   const firstSectionTitle = await firstRoadmapSection.locator('h4').innerText();
@@ -44,10 +41,13 @@ try {
   await expect(page.getByText('Generate this lesson on demand.')).toBeVisible();
   evidence.push('lazy-lesson-not-prefetched');
   await page.locator('.course-rail .rail-lessons > button').first().click();
-  await expect(page.locator('.lesson-reading__section').first()).toBeVisible();
+  await expect(page.locator('.lesson-article--streaming')).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('.lesson-article--streaming .lesson-markdown')).toBeVisible({ timeout: 60_000 });
+  evidence.push('lesson-markdown-streamed-into-article');
+  await expect(page.locator('.lesson-markdown, .lesson-reading__section').first()).toBeVisible();
   evidence.push('article-first-lesson');
   const lessonOverview = await page.locator('.lesson-overview p').innerText();
-  const lessonOpening = await page.locator('.lesson-reading__section').first().locator('p').first().innerText();
+  const lessonOpening = await page.locator('.lesson-markdown p, .lesson-reading__section p').first().innerText();
   if (lessonOverview.split(/[.!?]+/).map((part) => part.trim()).filter(Boolean).length < 2) throw new Error('Lesson overview must contain an editorial two-sentence deck.');
   if (lessonOpening.split(/\s+/).filter(Boolean).length < 45) throw new Error('Lesson opening must be a substantial article paragraph.');
   evidence.push('editorial-intro-quality');

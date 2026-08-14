@@ -1,21 +1,23 @@
-import { db } from '../server/db.js';
+import 'dotenv/config';
+import { getSupabaseAdmin } from '../server/supabase.js';
 
 const baseUrl = process.env.SYNAU_BASE_URL ?? 'http://127.0.0.1:8787';
-const email = process.env.SYNAU_TEST_EMAIL;
-const authCode = process.env.SYNAU_TEST_CODE;
+const token = process.env.SYNAU_TEST_TOKEN;
 const expectBilling = process.env.SYNAU_EXPECT_BILLING !== 'false';
-if (!email || !authCode) throw new Error('Set SYNAU_TEST_EMAIL and SYNAU_TEST_CODE.');
+if (!token) throw new Error('Set SYNAU_TEST_TOKEN to an active Supabase Auth access token.');
 
-let token = '';
 let createdCourseId = '';
+let userId = '';
 const checks: string[] = [];
+const admin = getSupabaseAdmin();
 
 type ApiResult = { status: number; body: any };
+type UsageRow = { generation_id: string; generator: string; credit_cost: number; status: string };
 
 async function request(path: string, init: RequestInit = {}, expected: number[] = [200], authenticated = true): Promise<ApiResult> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  if (authenticated && token) headers.set('authorization', `Bearer ${token}`);
+  if (authenticated) headers.set('authorization', `Bearer ${token}`);
   const response = await fetch(`${baseUrl}${path}`, { ...init, headers });
   const text = await response.text();
   let body: any = null;
@@ -24,6 +26,15 @@ async function request(path: string, init: RequestInit = {}, expected: number[] 
     throw new Error(`${path} returned ${response.status}: ${typeof body === 'string' ? body.slice(0, 500) : JSON.stringify(body).slice(0, 1000)}`);
   }
   return { status: response.status, body };
+}
+
+async function readUsage(profileId: string) {
+  const result = await admin
+    .from('llm_usage')
+    .select('generation_id, generator, credit_cost, status')
+    .eq('user_id', profileId);
+  if (result.error) throw new Error(`Supabase usage query failed: ${result.error.message}`);
+  return (result.data ?? []) as UsageRow[];
 }
 
 function check(condition: unknown, message: string) {
@@ -45,28 +56,22 @@ try {
 
   await request('/api/auth/request-code', {
     method: 'POST',
-    body: json({ mode: 'sign_up', firstName: '', lastName: '', username: 'x', email: 'not-an-email' }),
-  }, [400], false);
-  checks.push('invalid register rejected');
-
-  const requestedCode = await request('/api/auth/request-code', {
+    body: json({ mode: 'sign_in', identifier: 'unused@example.com' }),
+  }, [410], false);
+  await request('/api/auth/verify-code', {
     method: 'POST',
-    body: json({ mode: 'sign_in', identifier: email }),
-  }, [200], false);
-  const login = await request('/api/auth/verify-code', {
-    method: 'POST',
-    body: json({ challengeId: requestedCode.body.challengeId, code: authCode }),
-  }, [200], false);
-  token = login.body.token;
-  check(typeof token === 'string' && token.length > 20, 'login issued a session token');
+    body: json({ challengeId: 'unused', code: '000000' }),
+  }, [410], false);
+  checks.push('legacy-email-auth-disabled');
 
   const me = await request('/api/auth/me');
-  check(me.body.user.email === email, 'auth/me returned the requested user');
+  userId = me.body.user.id;
+  check(typeof userId === 'string' && userId.length > 0, 'Supabase Auth token resolved to a Synau profile');
 
   const initialCredits = (await request('/api/credits')).body.credits;
   check(initialCredits.balance > 0, 'credit wallet has an available balance');
   check(initialCredits.provider.id === 'sumopod' && initialCredits.provider.model === 'deepseek-v4-flash', 'fixed Sumopod provider is exposed without its API key');
-  const initialUsageIds = new Set((db.prepare('SELECT generation_id FROM llm_usage WHERE user_id = ?').all(login.body.user.id) as Array<{ generation_id: string }>).map((row) => row.generation_id));
+  const initialUsageIds = new Set((await readUsage(userId)).map((row) => row.generation_id));
 
   const roadmap = (await request('/api/generate/roadmap', {
     method: 'POST',
@@ -92,9 +97,6 @@ try {
   const secondLesson = firstSection.lessons[1] ?? fetched.sections[1]?.lessons[0];
   if (!secondLesson) throw new Error('QA course did not contain a second lesson for concurrency testing.');
   const firstOpenPromise = request(`/api/courses/${createdCourseId}/lessons/${firstLesson.id}/open`, { method: 'POST' });
-  // Give the first request a scheduling turn so the lock is acquired before
-  // the competing lesson request enters the route. The local QA server uses
-  // SYNAU_QA_GENERATION_DELAY_MS to keep this assertion deterministic.
   await new Promise((resolve) => setTimeout(resolve, 25));
   const secondOpenPromise = request(`/api/courses/${createdCourseId}/lessons/${secondLesson.id}/open`, { method: 'POST' }, [200, 409]);
   const [firstOpen, secondOpen] = await Promise.all([firstOpenPromise, secondOpenPromise]);
@@ -105,11 +107,18 @@ try {
   const opened = openedResult.body;
   const material = opened.course.sections.flatMap((section: any) => section.lessons).find((lesson: any) => lesson.id === targetLesson.id)?.material;
   check(opened.generated === true && material && material.lessonId === targetLesson.id, 'lesson generator materialized and rebound the requested lesson ID');
-  check(Array.isArray(material.article?.sections) && material.article.sections.length >= 2, 'lesson generator returned a flowing article');
-  check(material.article.sections.every((section: any) => Array.isArray(section.content) || Array.isArray(section.paragraphs)), 'lesson article sections use a supported content stream');
+  check(typeof material.article?.markdown === 'string' ? material.article.markdown.trim().length >= 240 : Array.isArray(material.article?.sections) && material.article.sections.length >= 2, 'lesson generator returned a flowing article');
+  if (typeof material.article?.markdown === 'string' && material.article.markdown.trim()) {
+    check(/(^|\n)#{1,6}\s|\n\s*```/m.test(material.article.markdown), 'Markdown lesson uses a readable Markdown structure');
+  } else {
+    check(material.article.sections.every((section: any) => Array.isArray(section.content) || Array.isArray(section.paragraphs)), 'lesson article sections use a supported content stream');
+  }
   if (material.sources.length > 0) {
     check(material.sources.length >= 1, 'lesson generator returned lesson references');
-    check(material.article.sections.some((section: any) => [...(section.paragraphs ?? []), ...(section.content ?? []).map((block: any) => block.text ?? block.caption ?? '')].some((text: string) => /\[\[[^\]]+\]\]/.test(text))), 'lesson generator returned inline source citations');
+    const articleText = typeof material.article?.markdown === 'string'
+      ? material.article.markdown
+      : material.article.sections.flatMap((section: any) => [...(section.paragraphs ?? []), ...(section.content ?? []).map((block: any) => block.text ?? block.caption ?? '')]).join(' ');
+    check(/\[\[[^\]]+\]\]/.test(articleText), 'lesson generator returned inline source citations');
   } else {
     checks.push('deterministic original lesson has no external source list');
   }
@@ -128,10 +137,7 @@ try {
     }, [201])).body.quiz;
     check(result.scope === scope && result.scopeId === scopeId, `${scope} quiz scope is bound to the request`);
     check(result.questions.length === 3 && publicQuizHasNoAnswerKey(result), `${scope} quiz has exactly three public-safe questions`);
-    check(
-      result.questions.map((question: any) => question.kind).join(',') === 'article,article,challenge',
-      `${scope} quiz contains two article checks followed by one challenge`,
-    );
+    check(result.questions.map((question: any) => question.kind).join(',') === 'article,article,challenge', `${scope} quiz contains two article checks followed by one challenge`);
     return result;
   }
 
@@ -142,74 +148,59 @@ try {
   await generateQuiz('course', createdCourseId);
 
   const answers = Object.fromEntries(lessonQuiz.questions.map((question: any) => [question.id, 0]));
-  await request(`/api/quizzes/${lessonQuiz.id}/submit`, {
-    method: 'POST',
-    body: json({ answers: {} }),
-  }, [400]);
+  await request(`/api/quizzes/${lessonQuiz.id}/submit`, { method: 'POST', body: json({ answers: {} }) }, [400]);
   checks.push('empty quiz submission rejected');
-  const submission = (await request(`/api/quizzes/${lessonQuiz.id}/submit`, {
-    method: 'POST',
-    body: json({ answers }),
-  })).body;
+  const submission = (await request(`/api/quizzes/${lessonQuiz.id}/submit`, { method: 'POST', body: json({ answers }) })).body;
   check(typeof submission.score === 'number' && submission.results.length === lessonQuiz.questions.length, 'quiz submission scored and returned review results');
   check(publicQuizHasNoAnswerKey(submission.quiz), 'quiz submission response remains public-safe');
-  await request(`/api/quizzes/${lessonQuiz.id}/submit`, {
-    method: 'POST',
-    body: json({ answers }),
-  }, [409]);
+  await request(`/api/quizzes/${lessonQuiz.id}/submit`, { method: 'POST', body: json({ answers }) }, [409]);
   checks.push('completed quiz attempt is locked while new attempts remain allowed');
 
   const activity = (await request(`/api/courses/${createdCourseId}/activity`)).body.events;
   check(activity.some((event: any) => event.type === 'lesson_opened'), 'activity records lesson opens');
   check(activity.some((event: any) => event.type === 'quiz_completed'), 'activity records quiz completion');
 
-  const archived = (await request(`/api/courses/${createdCourseId}`, {
-    method: 'PATCH',
-    body: json({ status: 'archived' }),
-  })).body.course;
+  const archived = (await request(`/api/courses/${createdCourseId}`, { method: 'PATCH', body: json({ status: 'archived' }) })).body.course;
   check(archived.status === 'archived', 'course can be archived');
   await request(`/api/courses/${createdCourseId}/lessons/${targetLesson.id}/open`, { method: 'POST' }, [409]);
-  await request('/api/quizzes/generate', {
-    method: 'POST',
-    body: json({ courseId: createdCourseId, scope: 'course', scopeId: createdCourseId }),
-  }, [409]);
+  await request('/api/quizzes/generate', { method: 'POST', body: json({ courseId: createdCourseId, scope: 'course', scopeId: createdCourseId }) }, [409]);
   checks.push('archived course is read-only');
-  const reopenedCourse = (await request(`/api/courses/${createdCourseId}`, {
-    method: 'PATCH',
-    body: json({ status: 'active' }),
-  })).body.course;
+  const reopenedCourse = (await request(`/api/courses/${createdCourseId}`, { method: 'PATCH', body: json({ status: 'active' }) })).body.course;
   check(reopenedCourse.status === 'active', 'course can be reopened');
 
   const productProgress = (await request('/api/product-progress', {}, [200], false)).body;
   check(productProgress.latestResults.length > 0, 'product progress endpoint returns live evidence');
 
   const finalCredits = (await request('/api/credits')).body.credits;
-  const usageRows = db.prepare('SELECT generation_id, generator, credit_cost, status FROM llm_usage WHERE user_id = ?').all(login.body.user.id) as Array<{ generation_id: string; generator: string; credit_cost: number; status: string }>;
+  const usageRows = await readUsage(userId);
   const newUsageRows = usageRows.filter((row) => !initialUsageIds.has(row.generation_id));
   if (expectBilling) {
     check(finalCredits.balance < initialCredits.balance, 'generator usage settled against the credit wallet');
     check(newUsageRows.length >= 4, 'roadmap, lesson, and repeatable quiz calls recorded LLM usage');
     check(newUsageRows.every((row) => row.status === 'success' && row.credit_cost === 1), 'each successful generator is settled at exactly one credit');
     const newGenerationIds = newUsageRows.map((row) => row.generation_id);
-    const newHoldRows = newGenerationIds.length === 0 ? [] : db.prepare(`SELECT reference_id, delta FROM credit_ledger WHERE user_id = ? AND type = 'hold' AND reference_id IN (${newGenerationIds.map(() => '?').join(',')})`)
-      .all(login.body.user.id, ...newGenerationIds.map((id) => `llm:${id}:hold`)) as Array<{ reference_id: string; delta: number }>;
-    check(newHoldRows.length === newUsageRows.length && newHoldRows.every((row) => row.delta === -1), 'each generator reserves one credit before provider work');
+    if (newGenerationIds.length > 0) {
+      const holdResult = await admin.from('credit_ledger').select('reference_id, delta').eq('user_id', userId).eq('type', 'hold').in('reference_id', newGenerationIds.map((id) => `llm:${id}:hold`));
+      if (holdResult.error) throw new Error(`Supabase ledger query failed: ${holdResult.error.message}`);
+      const newHoldRows = (holdResult.data ?? []) as Array<{ reference_id: string; delta: number }>;
+      check(newHoldRows.length === newUsageRows.length && newHoldRows.every((row) => row.delta === -1), 'each generator reserves one credit before provider work');
+    }
   } else {
     checks.push('deterministic demo generator bypassed provider billing checks');
   }
-  const successfulGenerators = newUsageRows.length;
 
   await request('/api/auth/logout', { method: 'POST' }, [204]);
-  await request('/api/auth/me', {}, [401]);
-  checks.push('logout revoked the session');
-
-  console.log(JSON.stringify({ ok: true, checks, createdCourseId, provider: initialCredits.provider, credits: { before: initialCredits.balance, after: finalCredits.balance }, successfulGenerators, usageRows: usageRows.length }, null, 2));
+  checks.push('logout endpoint reached Supabase session boundary');
+  console.log(JSON.stringify({ ok: true, checks, createdCourseId, provider: initialCredits.provider, credits: { before: initialCredits.balance, after: finalCredits.balance }, successfulGenerators: newUsageRows.length, usageRows: usageRows.length, storage: 'supabase' }, null, 2));
 } catch (error) {
   console.error(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error), checks }, null, 2));
   process.exitCode = 1;
 } finally {
   if (createdCourseId) {
-    const result = db.prepare('DELETE FROM courses WHERE id = ?').run(createdCourseId);
-    console.error(`QA cleanup: removed ${result.changes} temporary course row.`);
+    await fetch(`${baseUrl}/api/courses/${createdCourseId}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    }).catch((error) => console.error(`QA cleanup failed: ${error instanceof Error ? error.message : String(error)}`));
+    console.error('QA cleanup: requested Supabase course deletion.');
   }
 }

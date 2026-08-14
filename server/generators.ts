@@ -5,7 +5,7 @@ export const generatorTools = {
   },
   lesson: {
     name: 'write_subchapter_lesson',
-    description: 'Write one concise learning subchapter, using course memory to avoid repeating previously covered material.',
+    description: 'Write one substantial, natural Markdown learning article for a subchapter. Teach one distinct outcome, use course memory to avoid repetition, choose a fitting structure, and preserve relevant resources without forcing a template.',
   },
   quiz: {
     name: 'write_repeatable_quiz',

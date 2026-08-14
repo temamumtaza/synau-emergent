@@ -1,6 +1,4 @@
 import type {
-  AuthCodeResponse,
-  AuthResponse,
   Course,
   CreditSummary,
   GoogleAuthResponse,
@@ -13,7 +11,13 @@ import type {
   User,
 } from './types';
 
-const TOKEN_KEY = 'synau.session';
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
+
+function apiUrl(path: string) {
+  if (!apiBaseUrl) return path;
+  return `${apiBaseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
 export const CREDITS_CHANGED_EVENT = 'synau:credits-changed';
 const GET_IN_FLIGHT = new Map<string, Promise<unknown>>();
 const GET_CACHE = new Map<string, { expiresAt: number; value: unknown }>();
@@ -31,22 +35,8 @@ export class ApiError extends Error {
   }
 }
 
-export function getToken() {
-  return window.localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token: string) {
-  invalidateRequestCache();
-  window.localStorage.setItem(TOKEN_KEY, token);
-}
-
-export function clearToken() {
-  invalidateRequestCache();
-  window.localStorage.removeItem(TOKEN_KEY);
-}
-
-function cacheKey(path: string, authenticated: boolean, token: string | null) {
-  return `${authenticated ? token ?? 'anonymous' : 'public'}|${path}`;
+function cacheKey(path: string, authenticated: boolean) {
+  return `${authenticated ? 'session' : 'public'}|${path}`;
 }
 
 function invalidateRequestCache(pathPrefix?: string) {
@@ -67,9 +57,7 @@ const COURSE_TTL_MS = 30_000;
 const CREDITS_TTL_MS = 5_000;
 
 function cacheValue<T>(path: string, value: T, ttlMs: number) {
-  const token = getToken();
-  if (!token) return;
-  GET_CACHE.set(cacheKey(path, true, token), { expiresAt: Date.now() + ttlMs, value });
+  GET_CACHE.set(cacheKey(path, true), { expiresAt: Date.now() + ttlMs, value });
 }
 
 function cachedCoursePath(courseId: string) {
@@ -89,9 +77,7 @@ function metadataCourse(course: Course): Course {
 function cacheCourse(course: Course, updateCourseList = true) {
   cacheValue(cachedCoursePath(course.id), { course }, COURSE_TTL_MS);
   if (!updateCourseList) return;
-  const token = getToken();
-  if (!token) return;
-  const listKey = cacheKey('/api/courses', true, token);
+  const listKey = cacheKey('/api/courses', true);
   const cachedList = GET_CACHE.get(listKey)?.value as { courses?: Course[] } | undefined;
   if (!cachedList?.courses) return;
   const listCourse = metadataCourse(course);
@@ -103,10 +89,8 @@ function cacheCourse(course: Course, updateCourseList = true) {
 }
 
 function removeCachedCourse(courseId: string) {
-  const token = getToken();
-  if (!token) return;
-  GET_CACHE.delete(cacheKey(cachedCoursePath(courseId), true, token));
-  const listKey = cacheKey('/api/courses', true, token);
+  GET_CACHE.delete(cacheKey(cachedCoursePath(courseId), true));
+  const listKey = cacheKey('/api/courses', true);
   const cachedList = GET_CACHE.get(listKey)?.value as { courses?: Course[] } | undefined;
   if (!cachedList?.courses) return;
   cacheValue('/api/courses', { courses: cachedList.courses.filter((course) => course.id !== courseId) }, COURSE_LIST_TTL_MS);
@@ -114,17 +98,13 @@ function removeCachedCourse(courseId: string) {
 
 async function performRequest<T>(path: string, init: RequestInit, authenticated: boolean): Promise<T> {
   const headers = new Headers(init.headers);
-  const token = getToken();
 
   if (init.body && !headers.has('content-type')) {
     headers.set('content-type', 'application/json');
   }
-  if (authenticated && token) {
-    headers.set('authorization', `Bearer ${token}`);
-  }
   let response: Response;
   try {
-    response = await fetch(path, { ...init, headers });
+    response = await fetch(apiUrl(path), { ...init, headers, credentials: init.credentials ?? 'include' });
   } catch {
     throw new ApiError('Synau could not reach the server. Check your connection and try again.', 0);
   }
@@ -136,7 +116,7 @@ async function performRequest<T>(path: string, init: RequestInit, authenticated:
   const payload = await response.json().catch(() => null) as { error?: string; code?: string } | null;
   if (!response.ok) {
     if (response.status === 401 && authenticated) {
-      clearToken();
+      invalidateRequestCache();
       window.dispatchEvent(new Event('synau:unauthorized'));
     }
     throw new ApiError(payload?.error ?? 'Something went wrong. Please try again.', response.status, payload?.code);
@@ -145,11 +125,107 @@ async function performRequest<T>(path: string, init: RequestInit, authenticated:
   return payload as T;
 }
 
+export type LessonStreamStatus = {
+  stage: string;
+  message: string;
+};
+
+export type LessonStreamHandlers = {
+  onStatus?: (status: LessonStreamStatus) => void;
+  onMarkdown?: (markdown: string, append: boolean) => void;
+};
+
+async function streamLessonRequest(
+  path: string,
+  handlers: LessonStreamHandlers,
+): Promise<{ course: Course; generated: boolean }> {
+  const headers = new Headers({ accept: 'text/event-stream' });
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl(path), { method: 'POST', headers, credentials: 'include' });
+  } catch {
+    throw new ApiError('Synau could not reach the server. Check your connection and try again.', 0);
+  }
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: string; code?: string } | null;
+    if (response.status === 401) {
+      invalidateRequestCache();
+      window.dispatchEvent(new Event('synau:unauthorized'));
+    }
+    throw new ApiError(payload?.error ?? 'Something went wrong. Please try again.', response.status, payload?.code);
+  }
+  if (!response.body) throw new ApiError('The lesson stream ended before it could start.', 502);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = '';
+  let eventName = '';
+  let eventData: string[] = [];
+  let completed: { course: Course; generated: boolean } | null = null;
+
+  const dispatch = (event: string, data: string) => {
+    if (!data) return;
+    const payload = JSON.parse(data) as Record<string, unknown>;
+    if (event === 'status' && typeof payload.stage === 'string' && typeof payload.message === 'string') {
+      handlers.onStatus?.({ stage: payload.stage, message: payload.message });
+      return;
+    }
+    if (event === 'markdown' && typeof payload.content === 'string') {
+      handlers.onMarkdown?.(payload.content, payload.append !== false);
+      return;
+    }
+    if (event === 'error') {
+      throw new ApiError(
+        typeof payload.error === 'string' ? payload.error : 'Lesson generation failed.',
+        typeof payload.status === 'number' ? payload.status : 502,
+        typeof payload.code === 'string' ? payload.code : undefined,
+      );
+    }
+    if (event === 'complete' && payload.course) {
+      completed = payload as unknown as { course: Course; generated: boolean };
+    }
+  };
+
+  const flushEvent = () => {
+    const data = eventData.join('\n');
+    const currentEvent = eventName || 'message';
+    eventName = '';
+    eventData = [];
+    dispatch(currentEvent, data);
+  };
+
+  while (true) {
+    const result = await reader.read();
+    pending += decoder.decode(result.value ?? new Uint8Array(), { stream: !result.done });
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.trim()) {
+        flushEvent();
+      } else if (line.startsWith('event:')) {
+        eventName = line.slice('event:'.length).trim();
+      } else if (line.startsWith('data:')) {
+        eventData.push(line.slice('data:'.length).trimStart());
+      }
+    }
+    if (result.done) break;
+  }
+  if (pending.trim()) {
+    if (pending.startsWith('event:')) eventName = pending.slice('event:'.length).trim();
+    else if (pending.startsWith('data:')) eventData.push(pending.slice('data:'.length).trimStart());
+  }
+  if (eventData.length > 0) flushEvent();
+  if (!completed) throw new ApiError('The lesson stream ended before the lesson was saved.', 502);
+  return completed;
+}
+
 function request<T>(path: string, init: RequestInit = {}, authenticated = true, cacheTtlMs = 0): Promise<T> {
   const method = (init.method ?? 'GET').toUpperCase();
   if (method !== 'GET') return performRequest<T>(path, init, authenticated);
 
-  const key = cacheKey(path, authenticated, getToken());
+  const key = cacheKey(path, authenticated);
   if (cacheTtlMs > 0) {
     const cached = GET_CACHE.get(key);
     if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.value as T);
@@ -179,35 +255,17 @@ const jsonBody = (value: unknown) => JSON.stringify(value);
 
 export const api = {
   authConfig() {
-    return request<{ provider: 'google' | 'email' }>('/api/auth/config', {}, false);
+    return request<{ provider: 'google' }>('/api/auth/config', {}, false);
   },
 
   completeGoogleAuth(accessToken: string, profile?: { firstName: string; lastName: string; username: string }) {
     return request<GoogleAuthResponse>('/api/auth/google/session', {
       method: 'POST',
       body: jsonBody({ accessToken, ...profile }),
-    }, false);
-  },
-
-  requestSignInCode(identifier: string) {
-    return request<AuthCodeResponse>('/api/auth/request-code', {
-      method: 'POST',
-      body: jsonBody({ mode: 'sign_in', identifier }),
-    }, false);
-  },
-
-  requestSignUpCode(input: { firstName: string; lastName: string; username: string; email: string }) {
-    return request<AuthCodeResponse>('/api/auth/request-code', {
-      method: 'POST',
-      body: jsonBody({ mode: 'sign_up', ...input }),
-    }, false);
-  },
-
-  verifyAuthCode(challengeId: string, code: string) {
-    return request<AuthResponse>('/api/auth/verify-code', {
-      method: 'POST',
-      body: jsonBody({ challengeId, code }),
-    }, false);
+    }, false).then((result) => {
+      if (result.status === 'authenticated') invalidateRequestCache();
+      return result;
+    });
   },
 
   me() {
@@ -271,6 +329,17 @@ export const api = {
       `/api/courses/${encodeURIComponent(courseId)}/lessons/${encodeURIComponent(lessonId)}/open`,
       { method: 'POST' },
       true,
+    ).then((result) => {
+      cacheCourse(result.course, false);
+      markCreditsChanged();
+      return result;
+    });
+  },
+
+  openLessonStream(courseId: string, lessonId: string, handlers: LessonStreamHandlers = {}) {
+    return streamLessonRequest(
+      `/api/courses/${encodeURIComponent(courseId)}/lessons/${encodeURIComponent(lessonId)}/open`,
+      handlers,
     ).then((result) => {
       cacheCourse(result.course, false);
       markCreditsChanged();

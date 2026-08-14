@@ -34,49 +34,11 @@ export const GoogleAuthResponseSchema = z.discriminatedUnion('status', [
   }).strict(),
   z.object({
     status: z.literal('authenticated'),
-    token: z.string().min(20),
     user: UserSchema,
     created: z.boolean(),
   }).strict(),
 ]);
 export type GoogleAuthResponse = z.infer<typeof GoogleAuthResponseSchema>;
-
-export const AuthCodePurposeSchema = z.enum(['sign_in', 'sign_up']);
-export type AuthCodePurpose = z.infer<typeof AuthCodePurposeSchema>;
-
-const AuthEmailSchema = z.string().trim().email().max(254);
-const AuthUsernameSchema = z.string().trim().min(3).max(32).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,30}[a-zA-Z0-9]$/, 'Username must use letters, numbers, dots, underscores, or hyphens.');
-
-export const AuthCodeRequestSchema = z.discriminatedUnion('mode', [
-  z.object({
-    mode: z.literal('sign_in'),
-    identifier: z.string().trim().min(3).max(254),
-  }).strict(),
-  z.object({
-    mode: z.literal('sign_up'),
-    firstName: z.string().trim().min(1).max(60),
-    lastName: z.string().trim().min(1).max(60),
-    username: AuthUsernameSchema,
-    email: AuthEmailSchema,
-  }).strict(),
-]);
-export type AuthCodeRequest = z.infer<typeof AuthCodeRequestSchema>;
-
-export const AuthCodeVerifySchema = z.object({
-  challengeId: EntityIdSchema,
-  code: z.string().trim().regex(/^\d{6}$/, 'Verification code must be six digits.'),
-}).strict();
-export type AuthCodeVerify = z.infer<typeof AuthCodeVerifySchema>;
-
-export const AuthCodeResponseSchema = z.object({
-  challengeId: EntityIdSchema,
-  maskedEmail: z.string().min(1),
-  expiresAt: z.string(),
-  retryAfterSeconds: z.number().int().min(0),
-  isDemo: z.boolean(),
-  message: z.string().min(1),
-});
-export type AuthCodeResponse = z.infer<typeof AuthCodeResponseSchema>;
 
 export const CourseLanguageSchema = z.enum(['en', 'id']);
 export type CourseLanguage = z.infer<typeof CourseLanguageSchema>;
@@ -124,6 +86,19 @@ export const LessonGenerationInputSchema = z.object({
   lessonTitle: z.string(),
   lessonSummary: z.string(),
   courseMemory: z.array(z.string()).max(40),
+  lessonPosition: z.number().int().min(0).default(0),
+  lessonsInSection: z.number().int().min(1).default(1),
+  sectionPosition: z.number().int().min(0).default(0),
+  sectionsInCourse: z.number().int().min(1).default(1),
+  previousLesson: z.object({
+    title: EntityIdSchema,
+    summary: z.string().max(280),
+  }).strict().optional(),
+  previousSection: z.object({
+    title: EntityIdSchema,
+    summary: z.string().max(280),
+    lessonTitles: z.array(z.string().min(1).max(120)).max(8),
+  }).strict().optional(),
 });
 export type LessonGenerationInput = z.infer<typeof LessonGenerationInputSchema>;
 
@@ -273,6 +248,9 @@ export const LessonArticleSectionSchema = z.object({
 });
 
 export const LessonArticleSchema = z.object({
+  // New provider output is one loose Markdown document. The structured stream
+  // remains available for already-generated lessons and older clients.
+  markdown: z.string().trim().max(48_000).default(''),
   sections: z.array(LessonArticleSectionSchema).max(5).default([]),
 }).strict();
 export type LessonArticle = z.infer<typeof LessonArticleSchema>;
@@ -331,16 +309,19 @@ export const LessonMaterialSchema = z.object({
   // output is article-first; these fields are compatibility-only.
   blocks: z.array(LessonBlockSchema).max(6).default([]),
   nodes: z.array(LessonNodeSchema).max(5).default([]),
-  article: LessonArticleSchema.default({ sections: [] }),
+  article: LessonArticleSchema.default({ markdown: '', sections: [] }),
   sources: z.array(LessonSourceSchema).max(6).default([]),
-  keyTakeaway: z.string().min(1).max(280),
+  // The learner-facing article is the real content boundary. Keep the
+  // takeaway as a non-empty string, but do not impose an arbitrary prose
+  // length limit on generator output.
+  keyTakeaway: z.string().min(1),
   reflectivePrompt: z.string().min(1).max(280).optional(),
   sourceNote: z.string().min(1).max(280).optional(),
   practice: LessonPracticeSchema.optional(),
   dataLab: LessonDataLabSchema.optional(),
 }).superRefine((lesson, ctx) => {
-  if (lesson.article.sections.length < 2 && lesson.blocks.length < 2 && lesson.nodes.length < 2) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article'], message: 'A lesson requires at least two article sections or renderable components.' });
+  if (!lesson.article.markdown && lesson.article.sections.length < 2 && lesson.blocks.length < 2 && lesson.nodes.length < 2) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article'], message: 'A lesson requires Markdown, at least two article sections, or renderable legacy components.' });
   }
   const sourceIds = new Set<string>();
   for (const [index, source] of lesson.sources.entries()) {
@@ -369,6 +350,12 @@ export const LessonMaterialSchema = z.object({
       if (block.type === 'quote' && block.sourceId && !sourceIds.has(block.sourceId)) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'sections', sectionIndex, 'content', blockIndex, 'sourceId'], message: `Quote source ${block.sourceId} does not reference a lesson source.` });
       }
+    }
+  }
+  for (const match of lesson.article.markdown.matchAll(/\[\[([^\]]+)\]\]/g)) {
+    citedSourceIds.add(match[1]);
+    if (!sourceIds.has(match[1])) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['article', 'markdown'], message: `Citation ${match[1]} does not reference a lesson source.` });
     }
   }
 });

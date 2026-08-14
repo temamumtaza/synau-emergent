@@ -1,53 +1,69 @@
-import { db, newId, nowIso, json } from './db.js';
-import { createUser, getUserByEmail } from './auth.js';
-import { grantCredits, grantNewUserCredits } from './credits.js';
+import 'dotenv/config';
+import { RoadmapSchema } from '../shared/schemas.js';
+import { newId } from './utils.js';
+import { assertSupabaseRuntime, getSupabaseAdmin } from './supabase.js';
+import { remoteGetUserByLoginIdentifier } from './supabase-auth.js';
+import { remoteGrantNewUserCredits } from './supabase-credits.js';
+import { remoteCreateCourse } from './supabase-store.js';
 
-const email = 'demo@synau.local';
-const demoCode = '020599';
+assertSupabaseRuntime();
 
-let user = getUserByEmail(email);
-if (!user) {
-  user = createUser({ email, firstName: 'Demo', lastName: 'Learner', username: 'demo' });
-  grantNewUserCredits(user.id);
-}
+const email = (process.env.SYNAU_SEED_EMAIL ?? '').trim().toLowerCase();
+if (!email) throw new Error('Set SYNAU_SEED_EMAIL to an existing Google-linked Synau profile.');
 
-grantCredits({
-  userId: user.id,
-  credits: 10_000,
-  referenceId: 'demo-development-topup-10000',
-  description: 'Development top-up: 10.000 demo credits',
-  type: 'topup',
-  metadata: { credits: 10_000, amountIdr: 100_000, source: 'development grant' },
+const user = await remoteGetUserByLoginIdentifier(email);
+if (!user) throw new Error(`Supabase profile not found for ${email}. Sign in with Google once before seeding.`);
+
+await remoteGrantNewUserCredits(user.id);
+
+const existing = (await getSupabaseAdmin()
+  .from('courses')
+  .select('id')
+  .eq('user_id', user.id)
+  .eq('topic', 'Supabase seeded workflow')
+  .limit(1)
+  .maybeSingle()).data as { id: string } | null;
+
+const roadmap = RoadmapSchema.parse({
+  title: 'Supabase seeded workflow',
+  description: 'A small remote course used to verify the complete lazy-learning workflow.',
+  topic: 'Supabase seeded workflow',
+  language: 'id',
+  outcomes: [
+    'Review and approve a learning roadmap',
+    'Generate a lesson only when it is opened',
+    'Complete a repeatable quiz without gating progress',
+  ],
+  sections: [
+    {
+      id: newId(),
+      title: 'Fondasi alur belajar',
+      summary: 'Memahami bagaimana roadmap berubah menjadi ruang belajar yang bisa dijalankan.',
+      position: 0,
+      lessons: [
+        { id: newId(), title: 'Dari topik ke roadmap', summary: 'Membaca struktur dan tujuan sebuah learning path.', estimatedMinutes: 12, position: 0 },
+        { id: newId(), title: 'Membuka materi saat dibutuhkan', summary: 'Memahami prinsip lazy lesson generation.', estimatedMinutes: 15, position: 1 },
+      ],
+    },
+    {
+      id: newId(),
+      title: 'Menerapkan dan menguji pemahaman',
+      summary: 'Menggunakan artikel, progres, dan kuis untuk membangun pemahaman yang bertahan.',
+      position: 1,
+      lessons: [
+        { id: newId(), title: 'Membaca artikel secara aktif', summary: 'Menghubungkan konsep, contoh, dan pertanyaan.', estimatedMinutes: 15, position: 0 },
+        { id: newId(), title: 'Mengulang dengan kuis', summary: 'Menguji pemahaman tanpa mengunci progres.', estimatedMinutes: 12, position: 1 },
+      ],
+    },
+  ],
 });
 
-const existing = db.prepare('SELECT id FROM courses WHERE user_id = ? LIMIT 1').get(user.id) as { id: string } | undefined;
-if (!existing) {
-  const courseId = newId();
-  const sectionId = newId();
-  const createdAt = nowIso();
-  db.prepare(`INSERT INTO courses (id, user_id, topic, language, title, description, outcomes_json, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`).run(
-    courseId,
-    user.id,
-    'Writing better product briefs',
-    'en',
-    'Writing better product briefs: a practical learning path',
-    'A seeded course that demonstrates an existing learner state while new courses can still be created from a topic.',
-    json(['Frame a product problem clearly', 'Make a brief useful to collaborators', 'Use feedback to improve a decision']),
-    createdAt,
-    createdAt,
-  );
-  db.prepare('INSERT INTO course_sections (id, course_id, title, summary, position) VALUES (?, ?, ?, ?, ?)')
-    .run(sectionId, courseId, 'Foundations', 'The building blocks of a useful brief.', 0);
-  for (const [position, lesson] of [
-    ['Start with the decision', 'A brief is a decision aid, not a document dump.'],
-    ['Make the problem observable', 'Turn broad intent into a clear, testable problem.'],
-  ].entries()) {
-    db.prepare('INSERT INTO lessons (id, section_id, title, summary, estimated_minutes, position) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(newId(), sectionId, lesson[0], lesson[1], 12 + position * 3, position);
-  }
-  db.prepare(`INSERT INTO progress_events (id, user_id, course_id, event_type, data_json, created_at)
-    VALUES (?, ?, ?, 'course_seeded', ?, ?)`).run(newId(), user.id, courseId, json({ seeded: true }), createdAt);
-}
-
-console.log(JSON.stringify({ seeded: true, email, username: user.username, demoCode, database: process.env.SYNAU_DB_PATH ?? '.data/synau.db' }, null, 2));
+const course = existing ? null : await remoteCreateCourse(user.id, roadmap);
+console.log(JSON.stringify({
+  seeded: true,
+  storage: 'supabase',
+  email,
+  userId: user.id,
+  courseId: course?.id ?? existing?.id ?? null,
+  courseAlreadyExisted: Boolean(existing),
+}, null, 2));

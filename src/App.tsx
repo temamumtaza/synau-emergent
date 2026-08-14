@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
-import { api, clearToken, CREDITS_CHANGED_EVENT, getToken } from './api';
+import { api, CREDITS_CHANGED_EVENT } from './api';
 import { AuthScreen } from './components/AuthScreen';
 import { Icon } from './components/Icon';
 import type { User } from './types';
@@ -17,6 +17,20 @@ type AuthState =
   | { status: 'anonymous'; user: null }
   | { status: 'authenticated'; user: User };
 
+const appBasePath = import.meta.env.BASE_URL.replace(/\/$/, '');
+
+function appPath(pathname: string) {
+  if (appBasePath && (pathname === appBasePath || pathname.startsWith(`${appBasePath}/`))) {
+    return pathname.slice(appBasePath.length) || '/';
+  }
+  return pathname || '/';
+}
+
+function appHref(path: string) {
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return `${appBasePath}${normalized}` || '/';
+}
+
 type AppShellProps = {
   children: ReactNode;
   currentPath: string;
@@ -26,17 +40,17 @@ type AppShellProps = {
 };
 
 function useLocation() {
-  const [path, setPath] = useState(() => window.location.pathname);
+  const [path, setPath] = useState(() => appPath(window.location.pathname));
 
   useEffect(() => {
-    const handlePopState = () => setPath(window.location.pathname);
+    const handlePopState = () => setPath(appPath(window.location.pathname));
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
   const navigate = useCallback((nextPath: string) => {
-    if (nextPath !== window.location.pathname) {
-      window.history.pushState({}, '', nextPath);
+    if (nextPath !== appPath(window.location.pathname)) {
+      window.history.pushState({}, '', appHref(nextPath));
       setPath(nextPath);
       window.scrollTo({ top: 0, behavior: 'instant' });
     }
@@ -58,7 +72,7 @@ function AppLink({ children, className, href, onNavigate }: {
     }
   }
 
-  return <a className={className} href={href} onClick={handleClick}>{children}</a>;
+  return <a className={className} href={appHref(href)} onClick={handleClick}>{children}</a>;
 }
 
 function AppShell({ children, currentPath, onLogout, onNavigate, user }: AppShellProps) {
@@ -205,12 +219,9 @@ function NotFound({ onNavigate }: { onNavigate: (path: string) => void }) {
 
 export function App() {
   const { path, navigate } = useLocation();
-  const [auth, setAuth] = useState<AuthState>(() => getToken()
-    ? { status: 'checking', user: null }
-    : { status: 'anonymous', user: null });
+  const [auth, setAuth] = useState<AuthState>({ status: 'checking', user: null });
 
   useEffect(() => {
-    if (!getToken()) return;
     let active = true;
     api.me()
       .then(({ user }) => {
@@ -235,7 +246,6 @@ export function App() {
       // A local sign-out should still succeed when the session has already expired.
     } finally {
       await signOutGoogle().catch(() => undefined);
-      clearToken();
       setAuth({ status: 'anonymous', user: null });
       navigate('/');
     }

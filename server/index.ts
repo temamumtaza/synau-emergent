@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'node:fs';
@@ -5,20 +6,22 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { createServer as createViteServer, type ViteDevServer } from 'vite';
-import { db, json, newId, nowIso, parseJson, cleanExpiredSessions } from './db.js';
+import { newId, nowIso } from './utils.js';
 import {
-  getUserById,
   requireAuth,
-  revokeSession,
   AuthFlowError,
+  assertSessionCookieRuntime,
+  authTokenOf,
+  clearSessionCookie,
   publicUser,
+  setSessionCookie,
   type AuthRequest,
 } from './auth.js';
 import { generateLesson, generateQuiz, generateRoadmap } from './ai.js';
-import { billingStatusCode, createCreditTopUp, getCreditSummary, handleMidtransNotification, redeemCreditToken, syncCreditTopUp } from './credits.js';
-import { isSupabaseStorage } from './supabase.js';
-import { completeSupabaseGoogleAuth, remoteGetUserById, remoteRevokeSession } from './supabase-auth.js';
+import { assertSupabaseRuntime } from './supabase.js';
+import { completeSupabaseGoogleAuth, remoteCreateSession, remoteGetUserById, remoteRevokeSession } from './supabase-auth.js';
 import { performanceMiddleware } from './performance.js';
+import { createRateLimiter } from './rate-limit.js';
 import {
   remoteActivity,
   remoteAcquireLessonLock,
@@ -38,24 +41,20 @@ import {
   remoteSaveLessonMaterial,
   remoteSerializeCourse,
   remoteUpdateCourse,
+  supabaseHealth,
 } from './supabase-store.js';
 import {
   remoteBillingStatusCode,
-  remoteCreateCreditTopUp,
   remoteGetCreditSummary,
   remoteGrantNewUserCredits,
-  remoteHandleMidtransNotification,
   remoteRedeemCreditToken,
-  remoteSyncCreditTopUp,
 } from './supabase-credits.js';
 import {
-  CourseSchema,
   CoursePatchSchema,
   GoogleAuthRequestSchema,
   GoogleAuthResponseSchema,
   createQuizSubmissionSchema,
   LessonMaterialSchema,
-  CreateTopUpInputSchema,
   RedeemCreditInputSchema,
   ProductProgressSchema,
   QuizPublicSchema,
@@ -65,14 +64,16 @@ import {
   RoadmapSchema,
   TopicInputSchema,
   UserSchema,
-  lessonMaterialContext,
-  type Course,
   type LessonMaterial,
-  type Roadmap,
 } from '../shared/schemas.js';
+
+assertSupabaseRuntime();
+assertSessionCookieRuntime();
 
 const app = express();
 app.disable('x-powered-by');
+const isProduction = process.env.NODE_ENV === 'production';
+app.set('trust proxy', process.env.SYNAU_TRUST_PROXY === 'true');
 
 class CorsOriginError extends Error {}
 
@@ -93,14 +94,41 @@ function isLoopbackOrigin(origin: string) {
   }
 }
 
-const configuredOrigin = process.env.SYNAU_CORS_ORIGIN;
-if (configuredOrigin && !isLoopbackOrigin(configuredOrigin)) {
-  throw new Error('SYNAU_CORS_ORIGIN must be a loopback HTTP(S) origin.');
+const configuredOriginInput = process.env.SYNAU_CORS_ORIGIN?.trim();
+let configuredOrigin: string | undefined;
+try {
+  configuredOrigin = configuredOriginInput ? new URL(configuredOriginInput).origin : undefined;
+} catch {
+  configuredOrigin = configuredOriginInput;
+}
+function isHttpOrigin(value: string) {
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:')
+      && !url.username
+      && !url.password
+      && url.pathname === '/'
+      && !url.search
+      && !url.hash;
+  } catch {
+    return false;
+  }
 }
 
-const host = process.env.SYNAU_HOST ?? '127.0.0.1';
-if (!isLoopbackHostname(host)) {
-  throw new Error('SYNAU_HOST must remain loopback-only (127.0.0.1, localhost, or ::1).');
+if (isProduction && (!configuredOrigin || !isHttpOrigin(configuredOrigin))) {
+  throw new Error('Production requires SYNAU_CORS_ORIGIN to be an absolute app origin.');
+}
+if (!isProduction && configuredOrigin && !isLoopbackOrigin(configuredOrigin)) {
+  throw new Error('SYNAU_CORS_ORIGIN must be a loopback HTTP(S) origin during development.');
+}
+
+const host = process.env.SYNAU_HOST ?? (isProduction ? '0.0.0.0' : '127.0.0.1');
+const bindableHost = isLoopbackHostname(host) || host === '0.0.0.0' || host === '::';
+if (!bindableHost) {
+  throw new Error('SYNAU_HOST must be a loopback, 0.0.0.0, or :: bind address.');
+}
+if (isProduction && !isLoopbackHostname(host) && process.env.SYNAU_COOKIE_SECURE === 'false') {
+  throw new Error('Production deployments must keep SYNAU_COOKIE_SECURE=true when not bound to loopback.');
 }
 
 const port = Number(process.env.PORT ?? 8787);
@@ -114,23 +142,89 @@ if (!Number.isInteger(hmrPort) || hmrPort < 1 || hmrPort > 65_535) {
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || configuredOrigin === origin || isLoopbackOrigin(origin)) {
+    if (!origin || configuredOrigin === origin || (!isProduction && isLoopbackOrigin(origin))) {
       callback(null, true);
       return;
     }
     callback(new CorsOriginError('Origin is not allowed by this local Synau server.'));
   },
+  credentials: true,
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', (_req, res, next) => {
-  // All API responses are user-scoped. Browser memory caching is handled by
-  // the explicit client cache; shared HTTP caches must never retain them.
   res.setHeader('Cache-Control', 'private, no-store');
   next();
 });
 app.use(performanceMiddleware);
 
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  if (isProduction) {
+    const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').replace(/\/$/, '');
+    const connectSources = ["'self'", supabaseUrl, 'https://accounts.google.com'].filter(Boolean).join(' ');
+    res.setHeader('Content-Security-Policy', [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "font-src 'self' data:",
+      "img-src 'self' https: data:",
+      `connect-src ${connectSources}`,
+      "object-src 'none'",
+      "base-uri 'self'",
+      "frame-ancestors 'none'",
+      "form-action 'self' https://accounts.google.com https://*.supabase.co",
+    ].join('; '));
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    if (process.env.SYNAU_COOKIE_SECURE !== 'false') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+  }
+  next();
+});
+
+app.use('/api', (req, res, next) => {
+  const unsafeMethod = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+  const origin = req.header('origin');
+  if (isProduction && unsafeMethod && origin && origin !== configuredOrigin) {
+    res.status(403).json({ error: 'This origin is not allowed.', code: 'csrf_origin_rejected' });
+    return;
+  }
+  next();
+});
+
+const authRateLimit = createRateLimiter({ name: 'auth', windowMs: 15 * 60 * 1_000, max: 30 });
+const generatorRateLimit = createRateLimiter({ name: 'generator', windowMs: 5 * 60 * 1_000, max: 30 });
+
+function isProtectedSourcePath(requestPath: string) {
+  let pathname = requestPath;
+  try {
+    pathname = decodeURIComponent(new URL(requestPath, 'http://synau.local').pathname);
+  } catch {
+    // Keep the original path and let the normal router handle malformed URLs.
+  }
+  const normalized = pathname.replaceAll('\\', '/');
+  return /(^|\/)\.(?:env|git)[^\/]*(?:\/|$)/i.test(normalized)
+    || /(^|\/)(?:server|dist-server|shared|supabase|scripts|quality)(?:\/|$)/i.test(normalized);
+}
+
+// Do this before Vite's middleware and before production's SPA fallback. A
+// direct browser request for backend source must be a 404 in every mode, not
+// a transformed TypeScript module (dev) or an accidental index.html (prod).
+app.use((req, res, next) => {
+  if (isProtectedSourcePath(req.originalUrl)) {
+    res.status(404).end();
+    return;
+  }
+  next();
+});
+
 const lessonGenerationFlights = new Map<string, Promise<unknown>>();
+const streamedMarkdownByFlight = new Map<string, string>();
 const userLessonGenerationFlights = new Map<string, {
   courseId: string;
   lessonId: string;
@@ -138,33 +232,6 @@ const userLessonGenerationFlights = new Map<string, {
   promise: Promise<unknown>;
 }>();
 const lessonGenerationLockTtlMs = 5 * 60 * 1000;
-
-type LessonGenerationLock = {
-  user_id: string;
-  course_id: string;
-  lesson_id: string;
-  lesson_title: string;
-  created_at: string;
-};
-
-function acquireLessonGenerationLock(userId: string, courseId: string, lessonId: string, lessonTitle: string) {
-  const staleBefore = new Date(Date.now() - lessonGenerationLockTtlMs).toISOString();
-  db.prepare('DELETE FROM lesson_generation_locks WHERE user_id = ? AND created_at <= ?').run(userId, staleBefore);
-  const inserted = db.prepare(`
-    INSERT OR IGNORE INTO lesson_generation_locks (user_id, course_id, lesson_id, lesson_title, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(userId, courseId, lessonId, lessonTitle, nowIso());
-  if (inserted.changes === 1) return { acquired: true as const };
-  return {
-    acquired: false as const,
-    lock: db.prepare('SELECT * FROM lesson_generation_locks WHERE user_id = ?').get(userId) as LessonGenerationLock | undefined,
-  };
-}
-
-function releaseLessonGenerationLock(userId: string, courseId: string, lessonId: string) {
-  db.prepare('DELETE FROM lesson_generation_locks WHERE user_id = ? AND course_id = ? AND lesson_id = ?')
-    .run(userId, courseId, lessonId);
-}
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const adjacentProjectDir = path.resolve(rootDir, '..');
@@ -191,17 +258,53 @@ function parseBody<T>(schema: z.ZodType<T>, req: Request, res: Response) {
 }
 
 function respondWithServiceError(res: Response, error: unknown, fallback: string) {
-  const billing = billingStatusCode(error);
+  const billing = remoteBillingStatusCode(error);
   if (billing) {
     res.status(billing.status).json(billing.body);
     return;
   }
-  const remoteBilling = remoteBillingStatusCode(error);
-  if (remoteBilling) {
-    res.status(remoteBilling.status).json(remoteBilling.body);
-    return;
-  }
-  res.status(502).json({ error: error instanceof Error ? error.message : fallback });
+  console.error(`[service] ${fallback}`, error instanceof Error ? error.message : error);
+  res.status(502).json({ error: fallback, code: 'service_error' });
+}
+
+function lessonStreamRequested(req: Request) {
+  return (req.headers.accept ?? '').toLocaleLowerCase().includes('text/event-stream');
+}
+
+function startLessonStream(res: Response) {
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    if (!res.writableEnded && !res.destroyed) res.end();
+  };
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) res.write(': synau-lesson-heartbeat\n\n');
+  }, 10_000);
+  res.once('close', close);
+  return close;
+}
+
+function writeLessonStreamEvent(res: Response, event: string, payload: unknown) {
+  if (res.writableEnded || res.destroyed) return;
+  res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function lessonStreamError(error: unknown, fallback: string) {
+  const billing = remoteBillingStatusCode(error);
+  if (billing) return { status: billing.status, body: billing.body };
+  console.error(`[lesson-stream] ${fallback}`, error instanceof Error ? error.message : error);
+  return {
+    status: 502,
+    body: { error: fallback, code: 'service_error' },
+  };
 }
 
 function respondWithAuthError(res: Response, error: unknown) {
@@ -214,252 +317,10 @@ function respondWithAuthError(res: Response, error: unknown) {
   res.status(503).json({ error: 'Authentication service is temporarily unavailable.', code: 'auth_service_unavailable' });
 }
 
-function courseRow(userId: string, courseId: string) {
-  return db.prepare('SELECT * FROM courses WHERE id = ? AND user_id = ?').get(courseId, userId) as {
-    id: string;
-    user_id: string;
-    topic: string;
-    language: 'en' | 'id';
-    title: string;
-    description: string;
-    outcomes_json: string;
-    status: 'active' | 'archived';
-    created_at: string;
-    updated_at: string;
-  } | undefined;
-}
-
-type CourseLessonRow = {
-  id: string;
-  section_id: string;
-  title: string;
-  summary: string;
-  estimated_minutes: number;
-  position: number;
-  material_json: string | null;
-  completed_at: string | null;
-};
-
-type CourseSectionRow = {
-  id: string;
-  course_id: string;
-  title: string;
-  summary: string;
-  position: number;
-};
-
-function buildCoursePayload(
-  course: {
-    id: string;
-    topic: string;
-    language: 'en' | 'id';
-    title: string;
-    description: string;
-    outcomes_json: string;
-    status: 'active' | 'archived';
-    created_at: string;
-  },
-  sections: CourseSectionRow[],
-  lessons: CourseLessonRow[],
-  includeMaterial: boolean,
-): Course {
-  const lessonsBySection = new Map<string, CourseLessonRow[]>();
-  for (const lesson of lessons) {
-    const sectionLessons = lessonsBySection.get(lesson.section_id);
-    if (sectionLessons) sectionLessons.push(lesson);
-    else lessonsBySection.set(lesson.section_id, [lesson]);
-  }
-  const completedLessons = lessons.reduce((count, lesson) => count + (lesson.completed_at ? 1 : 0), 0);
-  const output = {
-    id: course.id,
-    topic: course.topic,
-    language: course.language ?? 'en',
-    title: course.title,
-    description: course.description,
-    outcomes: parseJson<string[]>(course.outcomes_json),
-    status: course.status,
-    createdAt: course.created_at,
-    sections: sections.map((section) => ({
-      id: section.id,
-      title: section.title,
-      summary: section.summary,
-      position: section.position,
-      lessons: (lessonsBySection.get(section.id) ?? []).map((lesson) => ({
-        id: lesson.id,
-        sectionId: lesson.section_id,
-        title: lesson.title,
-        summary: lesson.summary,
-        estimatedMinutes: lesson.estimated_minutes,
-        position: lesson.position,
-        material: includeMaterial && lesson.material_json
-          ? LessonMaterialSchema.parse(parseJson(lesson.material_json))
-          : null,
-        completedAt: lesson.completed_at,
-      })),
-    })),
-    progress: {
-      completedLessons,
-      totalLessons: lessons.length,
-      percent: lessons.length ? Math.round((completedLessons / lessons.length) * 100) : 0,
-    },
-  };
-  return CourseSchema.parse(output);
-}
-
-function serializeCourse(userId: string, courseId: string, includeMaterial = true): Course | null {
-  const course = courseRow(userId, courseId);
-  if (!course) return null;
-  const sections = db.prepare('SELECT * FROM course_sections WHERE course_id = ? ORDER BY position').all(courseId) as CourseSectionRow[];
-  const lessons = db.prepare(`
-    SELECT l.* FROM lessons l JOIN course_sections s ON s.id = l.section_id
-    WHERE s.course_id = ? ORDER BY s.position, l.position
-  `).all(courseId) as CourseLessonRow[];
-  return buildCoursePayload(course, sections, lessons, includeMaterial);
-}
-
-function serializeCourseList(userId: string): Course[] {
-  type CourseListRow = {
-    id: string;
-    topic: string;
-    language: 'en' | 'id';
-    title: string;
-    description: string;
-    outcomes_json: string;
-    status: 'active' | 'archived';
-    created_at: string;
-    section_id: string | null;
-    section_title: string | null;
-    section_summary: string | null;
-    section_position: number | null;
-    lesson_id: string | null;
-    lesson_section_id: string | null;
-    lesson_title: string | null;
-    lesson_summary: string | null;
-    estimated_minutes: number | null;
-    lesson_position: number | null;
-    completed_at: string | null;
-  };
-  const rows = db.prepare(`
-    SELECT c.id, c.topic, c.language, c.title, c.description, c.outcomes_json, c.status, c.created_at,
-      s.id AS section_id, s.title AS section_title, s.summary AS section_summary, s.position AS section_position,
-      l.id AS lesson_id, l.section_id AS lesson_section_id, l.title AS lesson_title, l.summary AS lesson_summary,
-      l.estimated_minutes, l.position AS lesson_position, l.completed_at
-    FROM courses c
-    LEFT JOIN course_sections s ON s.course_id = c.id
-    LEFT JOIN lessons l ON l.section_id = s.id
-    WHERE c.user_id = ?
-    ORDER BY c.updated_at DESC, s.position, l.position
-  `).all(userId) as CourseListRow[];
-  const grouped = new Map<string, {
-    course: CourseListRow;
-    sections: Map<string, { id: string; course_id: string; title: string; summary: string; position: number; lessons: CourseLessonRow[] }>;
-  }>();
-  for (const row of rows) {
-    let entry = grouped.get(row.id);
-    if (!entry) {
-      entry = { course: row, sections: new Map() };
-      grouped.set(row.id, entry);
-    }
-    if (!row.section_id || row.section_title === null || row.section_summary === null || row.section_position === null) continue;
-    let section = entry.sections.get(row.section_id);
-    if (!section) {
-      section = { id: row.section_id, course_id: row.id, title: row.section_title, summary: row.section_summary, position: row.section_position, lessons: [] };
-      entry.sections.set(row.section_id, section);
-    }
-    if (row.lesson_id && row.lesson_section_id && row.lesson_title !== null && row.lesson_summary !== null && row.estimated_minutes !== null && row.lesson_position !== null) {
-      section.lessons.push({
-        id: row.lesson_id,
-        section_id: row.lesson_section_id,
-        title: row.lesson_title,
-        summary: row.lesson_summary,
-        estimated_minutes: row.estimated_minutes,
-        position: row.lesson_position,
-        material_json: null,
-        completed_at: row.completed_at,
-      });
-    }
-  }
-  return [...grouped.values()].map(({ course, sections }) => buildCoursePayload(
-    course,
-    [...sections.values()].sort((left, right) => left.position - right.position),
-    [...sections.values()].flatMap((section) => section.lessons),
-    false,
-  ));
-}
-
-function getCourseMemory(courseId: string) {
-  const rows = db.prepare(`
-    SELECT l.title, l.material_json FROM lessons l
-    JOIN course_sections s ON s.id = l.section_id
-    WHERE s.course_id = ? AND l.material_json IS NOT NULL
-    ORDER BY l.last_generated_at DESC
-  `).all(courseId) as Array<{ title: string; material_json: string }>;
-  return rows.flatMap((row) => {
-    const material = LessonMaterialSchema.parse(parseJson(row.material_json));
-    return [`${row.title}: ${material.keyTakeaway}`, ...lessonMaterialContext(material).slice(0, 3)];
-  }).slice(0, 40);
-}
-
-function compactLessonContext(material: LessonMaterial | null) {
-  return material ? lessonMaterialContext(material).slice(0, 8).map((line) => line.slice(0, 700)) : [];
-}
-
-function addEvent(userId: string, courseId: string, eventType: string, lessonId?: string, data?: unknown) {
-  db.prepare(`
-    INSERT INTO progress_events (id, user_id, course_id, lesson_id, event_type, data_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(newId(), userId, courseId, lessonId ?? null, eventType, data ? json(data) : null, nowIso());
-}
-
-function courseContext(courseId: string, scope: 'lesson' | 'chapter' | 'course', scopeId: string) {
-  if (scope === 'lesson') {
-    const row = db.prepare(`
-      SELECT l.title, l.summary, l.material_json, s.title AS section_title
-      FROM lessons l JOIN course_sections s ON s.id = l.section_id
-      WHERE l.id = ? AND s.course_id = ?
-    `).get(scopeId, courseId) as { title: string; summary: string; material_json: string | null; section_title: string } | undefined;
-    if (!row) return null;
-    const material = row.material_json ? LessonMaterialSchema.parse(parseJson(row.material_json)) : null;
-    return { title: row.title, context: [row.summary, ...compactLessonContext(material)] };
-  }
-  if (scope === 'chapter') {
-    const section = db.prepare('SELECT title FROM course_sections WHERE id = ? AND course_id = ?').get(scopeId, courseId) as { title: string } | undefined;
-    if (!section) return null;
-    const rows = db.prepare('SELECT title, summary, material_json FROM lessons WHERE section_id = ? ORDER BY position').all(scopeId) as Array<{ title: string; summary: string; material_json: string | null }>;
-    return {
-      title: section.title,
-      context: rows.flatMap((row) => {
-        const material = row.material_json ? LessonMaterialSchema.parse(parseJson(row.material_json)) : null;
-        return [row.summary, ...compactLessonContext(material)];
-      }),
-    };
-  }
-  if (scopeId !== courseId) return null;
-  const course = db.prepare('SELECT title, description FROM courses WHERE id = ?').get(courseId) as { title: string; description: string } | undefined;
-  if (!course) return null;
-  const rows = db.prepare(`
-    SELECT l.title, l.summary, l.material_json FROM lessons l
-    JOIN course_sections s ON s.id = l.section_id WHERE s.course_id = ? ORDER BY s.position, l.position
-  `).all(courseId) as Array<{ title: string; summary: string; material_json: string | null }>;
-  return {
-    title: course.title,
-    context: [course.description, ...rows.flatMap((row) => {
-      const material = row.material_json ? LessonMaterialSchema.parse(parseJson(row.material_json)) : null;
-      return [row.summary, ...compactLessonContext(material)];
-    })],
-  };
-}
-
 app.get('/healthz', async (_req, res) => {
   try {
-    if (isSupabaseStorage()) {
-      const { supabaseHealth } = await import('./supabase-store.js');
-      await supabaseHealth();
-      res.json({ ok: true, service: 'synau', database: 'supabase' });
-      return;
-    }
-    db.prepare('SELECT 1 AS ok').get();
-    res.json({ ok: true, service: 'synau', database: 'ready' });
+    await supabaseHealth();
+    res.json({ ok: true, service: 'synau', database: 'supabase' });
   } catch {
     res.status(503).json({ ok: false, service: 'synau', database: 'unavailable' });
   }
@@ -469,16 +330,16 @@ app.get('/api/auth/config', (_req, res) => {
   res.json({ provider: 'google' as const });
 });
 
-app.post('/api/auth/google/session', async (req, res) => {
-  if (!isSupabaseStorage()) {
-    res.status(503).json({ error: 'Google sign-in requires Supabase storage. Configure SYNAU_STORAGE=supabase and restart the server.', code: 'google_auth_requires_supabase' });
-    return;
-  }
+app.post('/api/auth/google/session', authRateLimit, async (req, res) => {
   const body = parseBody(GoogleAuthRequestSchema, req, res);
   if (!body) return;
   try {
     const result = await completeSupabaseGoogleAuth(body);
-    if (result.status === 'authenticated' && result.created) await remoteGrantNewUserCredits(result.user.id);
+    if (result.status === 'authenticated') {
+      if (result.created) await remoteGrantNewUserCredits(result.user.id);
+      const session = await remoteCreateSession(result.user.id);
+      setSessionCookie(res, session.token, session.expiresAt);
+    }
     const response = result.status === 'authenticated'
       ? { ...result, user: UserSchema.parse(publicUser(result.user)) }
       : result;
@@ -488,23 +349,25 @@ app.post('/api/auth/google/session', async (req, res) => {
   }
 });
 
-app.post('/api/auth/request-code', async (req, res) => {
+// Kept as an explicit contract response so old clients fail safely instead of
+// attempting to revive the retired local email-code flow.
+app.post('/api/auth/request-code', async (_req, res) => {
   res.status(410).json({ error: 'Google sign-in is the only authentication method for Synau.', code: 'google_auth_only' });
 });
 
-app.post('/api/auth/verify-code', async (req, res) => {
+app.post('/api/auth/verify-code', async (_req, res) => {
   res.status(410).json({ error: 'Google sign-in is the only authentication method for Synau.', code: 'google_auth_only' });
 });
 
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
-  const token = (req.header('authorization') ?? '').slice(7);
-  if (isSupabaseStorage()) await remoteRevokeSession(token);
-  else revokeSession(token);
+  const token = authTokenOf(req);
+  await remoteRevokeSession(token);
+  clearSessionCookie(res);
   res.status(204).end();
 });
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
-  const user = isSupabaseStorage() ? await remoteGetUserById(userIdOf(req)) : getUserById(userIdOf(req));
+  const user = await remoteGetUserById(userIdOf(req));
   if (!user) {
     res.status(401).json({ error: 'Account not found.' });
     return;
@@ -513,14 +376,10 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 });
 
 app.get('/api/courses', requireAuth, async (req, res) => {
-  if (isSupabaseStorage()) {
-    res.json({ courses: await remoteListCourses(userIdOf(req)) });
-    return;
-  }
-  res.json({ courses: serializeCourseList(userIdOf(req)) });
+  res.json({ courses: await remoteListCourses(userIdOf(req)) });
 });
 
-app.post('/api/generate/roadmap', requireAuth, async (req, res) => {
+app.post('/api/generate/roadmap', requireAuth, generatorRateLimit, async (req, res) => {
   const body = parseBody(TopicInputSchema, req, res);
   if (!body) return;
   try {
@@ -534,38 +393,12 @@ app.post('/api/generate/roadmap', requireAuth, async (req, res) => {
 app.post('/api/courses', requireAuth, async (req, res) => {
   const body = parseBody(RoadmapSchema, req, res);
   if (!body) return;
-  const userId = userIdOf(req);
-  if (isSupabaseStorage()) {
-    const course = await remoteCreateCourse(userId, body);
-    res.status(201).json({ course });
-    return;
-  }
-  const courseId = newId();
-  const createdAt = nowIso();
-  const insert = db.transaction((roadmap: Roadmap) => {
-    db.prepare(`INSERT INTO courses (id, user_id, topic, language, title, description, outcomes_json, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
-      .run(courseId, userId, roadmap.topic, roadmap.language, roadmap.title, roadmap.description, json(roadmap.outcomes), createdAt, createdAt);
-    for (const section of roadmap.sections) {
-      const sectionId = newId();
-      db.prepare('INSERT INTO course_sections (id, course_id, title, summary, position) VALUES (?, ?, ?, ?, ?)')
-        .run(sectionId, courseId, section.title, section.summary, section.position);
-      for (const lesson of section.lessons) {
-        db.prepare(`INSERT INTO lessons (id, section_id, title, summary, estimated_minutes, position)
-          VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(newId(), sectionId, lesson.title, lesson.summary, lesson.estimatedMinutes, lesson.position);
-      }
-    }
-    addEvent(userId, courseId, 'course_created', undefined, { topic: roadmap.topic });
-  });
-  insert(body);
-  res.status(201).json({ course: serializeCourse(userId, courseId, false) });
+  const course = await remoteCreateCourse(userIdOf(req), body);
+  res.status(201).json({ course });
 });
 
 app.get('/api/courses/:courseId', requireAuth, async (req, res) => {
-  const course = isSupabaseStorage()
-    ? await remoteSerializeCourse(userIdOf(req), routeParam(req, 'courseId'))
-    : serializeCourse(userIdOf(req), routeParam(req, 'courseId'));
+  const course = await remoteSerializeCourse(userIdOf(req), routeParam(req, 'courseId'));
   if (!course) {
     res.status(404).json({ error: 'Course not found.' });
     return;
@@ -574,175 +407,110 @@ app.get('/api/courses/:courseId', requireAuth, async (req, res) => {
 });
 
 app.patch('/api/courses/:courseId', requireAuth, async (req, res) => {
-  const courseId = routeParam(req, 'courseId');
-  const course = isSupabaseStorage() ? undefined : courseRow(userIdOf(req), courseId);
   const body = parseBody(CoursePatchSchema, req, res);
   if (!body) return;
-  if (isSupabaseStorage()) {
-    const updated = await remoteUpdateCourse(userIdOf(req), courseId, body);
-    if (!updated) {
-      res.status(404).json({ error: 'Course not found.' });
-      return;
-    }
-    res.json({ course: updated });
-    return;
-  }
-  if (!course) {
+  const updated = await remoteUpdateCourse(userIdOf(req), routeParam(req, 'courseId'), body);
+  if (!updated) {
     res.status(404).json({ error: 'Course not found.' });
     return;
   }
-  const updatedAt = nowIso();
-  const nextTitle = body.title ?? course.title;
-  const nextStatus = body.status ?? course.status;
-  db.prepare('UPDATE courses SET title = ?, status = ?, updated_at = ? WHERE id = ? AND user_id = ?')
-    .run(nextTitle, nextStatus, updatedAt, courseId, userIdOf(req));
-  if (body.title !== undefined && body.title !== course.title) {
-    addEvent(userIdOf(req), courseId, 'course_renamed', undefined, { from: course.title, to: nextTitle });
-  }
-  if (body.status !== undefined && body.status !== course.status) {
-    addEvent(userIdOf(req), courseId, body.status === 'archived' ? 'course_archived' : 'course_reopened');
-  }
-  res.json({ course: serializeCourse(userIdOf(req), courseId, false) });
+  res.json({ course: updated });
 });
 
 app.delete('/api/courses/:courseId', requireAuth, async (req, res) => {
-  const userId = userIdOf(req);
-  const courseId = routeParam(req, 'courseId');
-  if (isSupabaseStorage()) {
-    const result = await remoteDeleteCourse(userId, courseId);
-    if (result.locked) {
-      res.status(409).json({ code: 'course_generation_in_progress', error: 'This learning path is generating a lesson. Wait for it to finish before deleting the course.' });
-      return;
-    }
-    if (result.notFound) {
-      res.status(404).json({ error: 'Course not found.' });
-      return;
-    }
-    res.status(result.deleted ? 204 : 404).end();
-    return;
-  }
-  const course = courseRow(userId, courseId);
-  if (!course) {
-    res.status(404).json({ error: 'Course not found.' });
-    return;
-  }
-  const activeFlight = userLessonGenerationFlights.get(userId);
-  const activeLock = db.prepare('SELECT lesson_id FROM lesson_generation_locks WHERE user_id = ? AND course_id = ?')
-    .get(userId, courseId) as { lesson_id: string } | undefined;
-  if (activeFlight?.courseId === courseId || activeLock) {
+  const result = await remoteDeleteCourse(userIdOf(req), routeParam(req, 'courseId'));
+  if (result.locked) {
     res.status(409).json({
       code: 'course_generation_in_progress',
       error: 'This learning path is generating a lesson. Wait for it to finish before deleting the course.',
     });
     return;
   }
-  db.prepare('DELETE FROM courses WHERE id = ? AND user_id = ?').run(courseId, userId);
-  res.status(204).end();
+  if (result.notFound) {
+    res.status(404).json({ error: 'Course not found.' });
+    return;
+  }
+  res.status(result.deleted ? 204 : 404).end();
 });
 
-app.post('/api/courses/:courseId/lessons/:lessonId/open', requireAuth, async (req, res) => {
+function lessonContinuity(course: Awaited<ReturnType<typeof remoteSerializeCourse>>, sectionId: string, lessonId: string) {
+  const defaults = {
+    lessonPosition: 0,
+    lessonsInSection: 1,
+    sectionPosition: 0,
+    sectionsInCourse: 1,
+  };
+  if (!course) return defaults;
+  const sectionPosition = course.sections.findIndex((candidate) => candidate.id === sectionId);
+  const section = sectionPosition >= 0 ? course.sections[sectionPosition] : undefined;
+  const lessonPosition = section?.lessons.findIndex((candidate) => candidate.id === lessonId) ?? -1;
+  if (!section || sectionPosition < 0 || lessonPosition < 0) return defaults;
+
+  const previousLesson = lessonPosition > 0 ? section.lessons[lessonPosition - 1] : undefined;
+  const previousSection = sectionPosition > 0 ? course.sections[sectionPosition - 1] : undefined;
+  return {
+    ...defaults,
+    lessonPosition,
+    lessonsInSection: section.lessons.length,
+    sectionPosition,
+    sectionsInCourse: course.sections.length,
+    // At a chapter boundary, use the previous chapter as the bridge instead
+    // of pretending that the last lesson is the whole preceding chapter.
+    ...(previousLesson ? { previousLesson: { title: previousLesson.title, summary: previousLesson.summary } } : {}),
+    ...(previousSection ? {
+      previousSection: {
+        title: previousSection.title,
+        summary: previousSection.summary,
+        lessonTitles: previousSection.lessons.map((lesson) => lesson.title),
+      },
+    } : {}),
+  };
+}
+
+app.post('/api/courses/:courseId/lessons/:lessonId/open', requireAuth, generatorRateLimit, async (req, res) => {
   const userId = userIdOf(req);
   const courseId = routeParam(req, 'courseId');
   const lessonId = routeParam(req, 'lessonId');
-  if (isSupabaseStorage()) {
-    const remoteLesson = await remoteLessonRow(userId, courseId, lessonId);
-    if (!remoteLesson) {
-      res.status(404).json({ error: 'Lesson not found.' });
+  const wantsStream = lessonStreamRequested(req);
+  const closeStream = wantsStream ? startLessonStream(res) : undefined;
+  const emit = (event: string, payload: unknown) => {
+    if (wantsStream) writeLessonStreamEvent(res, event, payload);
+  };
+  const finishError = (status: number, body: { error: string; code?: string; [key: string]: unknown }) => {
+    if (!wantsStream) {
+      res.status(status).json(body);
       return;
     }
-    if (remoteLesson.course.status === 'archived') {
-      res.status(409).json({ error: 'Archived courses are read-only. Reopen the course to generate material.' });
-      return;
+    emit('error', { status, ...body });
+    closeStream?.();
+  };
+  emit('status', { stage: 'connecting', message: 'Preparing the lesson stream.' });
+  let remoteLesson: Awaited<ReturnType<typeof remoteLessonRow>>;
+  try {
+    remoteLesson = await remoteLessonRow(userId, courseId, lessonId);
+  } catch (error) {
+    if (!wantsStream) respondWithServiceError(res, error, 'Could not open this lesson.');
+    else {
+      const failure = lessonStreamError(error, 'Could not open this lesson.');
+      emit('error', { status: failure.status, ...failure.body });
+      closeStream?.();
     }
-    let generated = false;
-    if (!remoteLesson.row.material_json) {
-      const activeUserFlight = userLessonGenerationFlights.get(userId);
-      if (activeUserFlight && (activeUserFlight.courseId !== courseId || activeUserFlight.lessonId !== lessonId)) {
-        res.status(409).json({
-          code: 'lesson_generation_in_progress',
-          error: `Another lesson is currently being generated: “${activeUserFlight.lessonTitle}”. Please wait for it to finish before opening another subchapter.`,
-          activeLessonId: activeUserFlight.lessonId,
-          activeCourseId: activeUserFlight.courseId,
-        });
-        return;
-      }
-      try {
-        const flightKey = `${courseId}:${lessonId}`;
-        let flight = lessonGenerationFlights.get(flightKey);
-        if (!flight && activeUserFlight && activeUserFlight.courseId === courseId && activeUserFlight.lessonId === lessonId) flight = activeUserFlight.promise;
-        if (!flight) {
-          const lockResult = await remoteAcquireLessonLock(userId, courseId, lessonId, remoteLesson.row.title, new Date(Date.now() - lessonGenerationLockTtlMs).toISOString());
-          if (!lockResult.acquired) {
-            const lock = lockResult.lock;
-            const sameLesson = lock?.course_id === courseId && lock.lesson_id === lessonId;
-            res.status(409).json({
-              code: 'lesson_generation_in_progress',
-              error: sameLesson ? 'This lesson is already being generated. Please wait for it to finish before trying again.' : `Another lesson is currently being generated: “${lock?.lesson_title ?? 'another subchapter'}”. Please wait for it to finish before opening another lesson.`,
-              activeLessonId: lock?.lesson_id ?? lessonId,
-              activeCourseId: lock?.course_id ?? courseId,
-            });
-            return;
-          }
-          generated = true;
-          const generation = Promise.resolve().then(async () => generateLesson({
-            courseId,
-            lessonId,
-            topic: remoteLesson.course.topic,
-            language: remoteLesson.course.language,
-            courseTitle: remoteLesson.course.title,
-            sectionTitle: remoteLesson.sectionTitle,
-            lessonTitle: remoteLesson.row.title,
-            lessonSummary: remoteLesson.row.summary,
-            courseMemory: await remoteGetCourseMemory(userId, courseId),
-          }, userId)).then(async (generatedMaterial) => {
-            const boundMaterial = LessonMaterialSchema.parse({ ...generatedMaterial, lessonId }) as LessonMaterial;
-            await remoteSaveLessonMaterial(lessonId, boundMaterial);
-            return boundMaterial;
-          }).finally(async () => {
-            await remoteReleaseLessonLock(userId, courseId, lessonId);
-            if (lessonGenerationFlights.get(flightKey) === generation) lessonGenerationFlights.delete(flightKey);
-            if (userLessonGenerationFlights.get(userId)?.promise === generation) userLessonGenerationFlights.delete(userId);
-          });
-          flight = generation;
-          lessonGenerationFlights.set(flightKey, generation);
-          userLessonGenerationFlights.set(userId, { courseId, lessonId, lessonTitle: remoteLesson.row.title, promise: generation });
-        }
-        await flight;
-      } catch (error) {
-        const billing = billingStatusCode(error) ?? remoteBillingStatusCode(error);
-        if (billing) res.status(billing.status).json(billing.body);
-        else res.status(502).json({ error: error instanceof Error ? error.message : 'Lesson generation failed.' });
-        return;
-      }
-    }
-    const openedCourse = await remoteOpenLesson(userId, courseId, lessonId);
-    if (!openedCourse) {
-      res.status(404).json({ error: 'Lesson not found.' });
-      return;
-    }
-    res.json({ course: openedCourse, generated });
     return;
   }
-  const course = courseRow(userId, courseId);
-  const row = db.prepare(`
-    SELECT l.*, s.title AS section_title FROM lessons l JOIN course_sections s ON s.id = l.section_id
-    WHERE l.id = ? AND s.course_id = ?
-  `).get(lessonId, courseId) as {
-    id: string; section_id: string; title: string; summary: string; material_json: string | null; section_title: string;
-  } | undefined;
-  if (!course || !row) {
-    res.status(404).json({ error: 'Lesson not found.' });
+  if (!remoteLesson) {
+    finishError(404, { error: 'Lesson not found.' });
     return;
   }
-  if (course.status === 'archived') {
-    res.status(409).json({ error: 'Archived courses are read-only. Reopen the course to generate material.' });
+  if (remoteLesson.course.status === 'archived') {
+    finishError(409, { error: 'Archived courses are read-only. Reopen the course to generate material.' });
     return;
   }
+
   let generated = false;
-  if (!row.material_json) {
+  if (!remoteLesson.row.material_json) {
     const activeUserFlight = userLessonGenerationFlights.get(userId);
-    if (activeUserFlight && (activeUserFlight.courseId !== courseId || activeUserFlight.lessonId !== row.id)) {
-      res.status(409).json({
+    if (activeUserFlight && (activeUserFlight.courseId !== courseId || activeUserFlight.lessonId !== lessonId)) {
+      finishError(409, {
         code: 'lesson_generation_in_progress',
         error: `Another lesson is currently being generated: “${activeUserFlight.lessonTitle}”. Please wait for it to finish before opening another subchapter.`,
         activeLessonId: activeUserFlight.lessonId,
@@ -752,124 +520,143 @@ app.post('/api/courses/:courseId/lessons/:lessonId/open', requireAuth, async (re
     }
 
     try {
-      const flightKey = `${courseId}:${row.id}`;
+      const flightKey = `${courseId}:${lessonId}`;
       let flight = lessonGenerationFlights.get(flightKey);
-      if (!flight && activeUserFlight && activeUserFlight.courseId === courseId && activeUserFlight.lessonId === row.id) {
+      if (!flight && activeUserFlight?.courseId === courseId && activeUserFlight.lessonId === lessonId) {
         flight = activeUserFlight.promise;
       }
       if (!flight) {
-        const lockResult = acquireLessonGenerationLock(userId, courseId, row.id, row.title);
+        const lockResult = await remoteAcquireLessonLock(
+          userId,
+          courseId,
+          lessonId,
+          remoteLesson.row.title,
+          new Date(Date.now() - lessonGenerationLockTtlMs).toISOString(),
+        );
         if (!lockResult.acquired) {
           const lock = lockResult.lock;
-          const sameLesson = lock?.course_id === courseId && lock.lesson_id === row.id;
-          res.status(409).json({
+          const sameLesson = lock?.course_id === courseId && lock.lesson_id === lessonId;
+          finishError(409, {
             code: 'lesson_generation_in_progress',
             error: sameLesson
               ? 'This lesson is already being generated. Please wait for it to finish before trying again.'
               : `Another lesson is currently being generated: “${lock?.lesson_title ?? 'another subchapter'}”. Please wait for it to finish before opening another subchapter.`,
-            activeLessonId: lock?.lesson_id ?? row.id,
+            activeLessonId: lock?.lesson_id ?? lessonId,
             activeCourseId: lock?.course_id ?? courseId,
           });
           return;
         }
+
         generated = true;
-        const generation = Promise.resolve().then(() => generateLesson({
-            courseId,
-            lessonId: row.id,
-            topic: course.topic,
-            language: course.language,
-            courseTitle: course.title,
-            sectionTitle: row.section_title,
-            lessonTitle: row.title,
-            lessonSummary: row.summary,
-            courseMemory: getCourseMemory(courseId),
-          }, userId)).then((material) => {
-          const boundMaterial = LessonMaterialSchema.parse({ ...material, lessonId: row.id }) as LessonMaterial;
-          db.prepare('UPDATE lessons SET material_json = ?, last_generated_at = ? WHERE id = ? AND material_json IS NULL')
-            .run(json(boundMaterial), nowIso(), row.id);
+        const generation = Promise.resolve().then(async () => generateLesson({
+          courseId,
+          lessonId,
+          topic: remoteLesson.course.topic,
+          language: remoteLesson.course.language,
+          courseTitle: remoteLesson.course.title,
+          sectionTitle: remoteLesson.sectionTitle,
+          lessonTitle: remoteLesson.row.title,
+          lessonSummary: remoteLesson.row.summary,
+          courseMemory: await remoteGetCourseMemory(userId, courseId),
+          ...lessonContinuity(remoteLesson.course, remoteLesson.row.section_id, lessonId),
+        }, userId, {
+          onStatus: (progress) => emit('status', progress),
+          onMarkdown: (markdown) => {
+            const previous = streamedMarkdownByFlight.get(flightKey) ?? '';
+            if (markdown.startsWith(previous)) {
+              const delta = markdown.slice(previous.length);
+              streamedMarkdownByFlight.set(flightKey, markdown);
+              if (delta) emit('markdown', { content: delta, append: true });
+            } else {
+              streamedMarkdownByFlight.set(flightKey, markdown);
+              emit('markdown', { content: markdown, append: false });
+            }
+          },
+        })).then(async (generatedMaterial) => {
+          emit('status', { stage: 'validating', message: 'Saving the validated lesson.' });
+          const boundMaterial = LessonMaterialSchema.parse({ ...generatedMaterial, lessonId }) as LessonMaterial;
+          await remoteSaveLessonMaterial(lessonId, boundMaterial);
           return boundMaterial;
-        }).finally(() => {
-          releaseLessonGenerationLock(userId, courseId, row.id);
+        }).finally(async () => {
+          try {
+            await remoteReleaseLessonLock(userId, courseId, lessonId);
+          } catch (error) {
+            console.error('[lesson-lock] release failed', error instanceof Error ? error.message : error);
+          }
           if (lessonGenerationFlights.get(flightKey) === generation) lessonGenerationFlights.delete(flightKey);
           if (userLessonGenerationFlights.get(userId)?.promise === generation) userLessonGenerationFlights.delete(userId);
+          streamedMarkdownByFlight.delete(flightKey);
         });
         flight = generation;
         lessonGenerationFlights.set(flightKey, generation);
         userLessonGenerationFlights.set(userId, {
           courseId,
-          lessonId: row.id,
-          lessonTitle: row.title,
+          lessonId,
+          lessonTitle: remoteLesson.row.title,
           promise: generation,
         });
       }
-      addEvent(userId, courseId, 'lesson_opened', row.id);
       await flight;
     } catch (error) {
-      const billing = billingStatusCode(error);
-      if (billing) res.status(billing.status).json(billing.body);
-      else res.status(502).json({ error: error instanceof Error ? error.message : 'Lesson generation failed.' });
+      if (!wantsStream) {
+        respondWithServiceError(res, error, 'Lesson generation failed.');
+      } else {
+        const failure = lessonStreamError(error, 'Lesson generation failed.');
+        emit('error', { status: failure.status, ...failure.body });
+        closeStream?.();
+      }
       return;
     }
-  } else {
-    addEvent(userId, courseId, 'lesson_opened', row.id);
   }
-  res.json({ course: serializeCourse(userId, courseId), generated });
+
+  let openedCourse: Awaited<ReturnType<typeof remoteOpenLesson>>;
+  try {
+    openedCourse = await remoteOpenLesson(userId, courseId, lessonId);
+  } catch (error) {
+    if (!wantsStream) respondWithServiceError(res, error, 'Could not open this lesson.');
+    else {
+      const failure = lessonStreamError(error, 'Could not open this lesson.');
+      emit('error', { status: failure.status, ...failure.body });
+      closeStream?.();
+    }
+    return;
+  }
+  if (!openedCourse) {
+    finishError(404, { error: 'Lesson not found.' });
+    return;
+  }
+  emit('status', { stage: 'validating', message: 'Lesson is ready.' });
+  if (wantsStream) {
+    emit('complete', { course: openedCourse, generated });
+    closeStream?.();
+  } else {
+    res.json({ course: openedCourse, generated });
+  }
 });
 
 app.post('/api/courses/:courseId/lessons/:lessonId/complete', requireAuth, async (req, res) => {
-  const userId = userIdOf(req);
-  const courseId = routeParam(req, 'courseId');
-  const lessonId = routeParam(req, 'lessonId');
-  if (isSupabaseStorage()) {
-    const completed = await remoteCompleteLesson(userId, courseId, lessonId);
-    if (completed.status === 'archived') {
-      res.status(409).json({ error: 'Archived courses are read-only.' });
-      return;
-    }
-    if (completed.status === 'not_found') {
-      res.status(404).json({ error: 'Lesson not found.' });
-      return;
-    }
-    res.json({ course: completed.course });
-    return;
-  }
-  const course = courseRow(userId, courseId);
-  const lesson = db.prepare(`SELECT l.id FROM lessons l JOIN course_sections s ON s.id = l.section_id
-    WHERE l.id = ? AND s.course_id = ?`).get(lessonId, courseId) as { id: string } | undefined;
-  if (!course || !lesson) {
-    res.status(404).json({ error: 'Lesson not found.' });
-    return;
-  }
-  if (course.status === 'archived') {
+  const completed = await remoteCompleteLesson(userIdOf(req), routeParam(req, 'courseId'), routeParam(req, 'lessonId'));
+  if (completed.status === 'archived') {
     res.status(409).json({ error: 'Archived courses are read-only.' });
     return;
   }
-  const current = db.prepare('SELECT completed_at FROM lessons WHERE id = ?').get(lesson.id) as { completed_at: string | null };
-  if (current.completed_at) {
-    res.json({ course: serializeCourse(userId, course.id) });
+  if (completed.status === 'not_found') {
+    res.status(404).json({ error: 'Lesson not found.' });
     return;
   }
-  const completedAt = nowIso();
-  db.prepare('UPDATE lessons SET completed_at = ? WHERE id = ?').run(completedAt, lesson.id);
-  db.prepare('UPDATE courses SET updated_at = ? WHERE id = ?').run(completedAt, course.id);
-  addEvent(userId, course.id, 'lesson_completed', lesson.id);
-  res.json({ course: serializeCourse(userId, course.id) });
+  res.json({ course: completed.course });
 });
 
-app.post('/api/quizzes/generate', requireAuth, async (req, res) => {
+app.post('/api/quizzes/generate', requireAuth, generatorRateLimit, async (req, res) => {
   const body = parseBody(QuizRequestSchema, req, res);
   if (!body) return;
   const userId = userIdOf(req);
-  const course = isSupabaseStorage()
-    ? await remoteSerializeCourse(userId, body.courseId)
-    : courseRow(userId, body.courseId);
+  const course = await remoteSerializeCourse(userId, body.courseId);
   if (!course) {
     res.status(404).json({ error: 'Quiz scope not found.' });
     return;
   }
-  const context = isSupabaseStorage()
-    ? await remoteCourseContext(userId, body.courseId, body.scope, body.scopeId)
-    : courseContext(body.courseId, body.scope, body.scopeId);
+  const context = await remoteCourseContext(userId, body.courseId, body.scope, body.scopeId);
   if (!context) {
     res.status(404).json({ error: 'Quiz scope not found.' });
     return;
@@ -886,18 +673,11 @@ app.post('/api/quizzes/generate', requireAuth, async (req, res) => {
       language: course.language,
       scopeTitle: context.title,
       materialContext: context.context,
-      courseMemory: isSupabaseStorage() ? await remoteGetCourseMemory(userId, body.courseId) : getCourseMemory(body.courseId),
+      courseMemory: await remoteGetCourseMemory(userId, body.courseId),
     }, userId);
-    const attemptId = newId();
-    const storedQuiz = QuizSchema.parse({ ...quiz, id: attemptId, scope: body.scope, scopeId: body.scopeId });
-    if (isSupabaseStorage()) {
-      await remoteInsertQuiz(userId, body.courseId, storedQuiz);
-      await remoteAddEvent(userId, body.courseId, 'quiz_started', body.scope === 'lesson' ? body.scopeId : undefined, { scope: body.scope });
-    } else {
-      db.prepare(`INSERT INTO quiz_attempts (id, user_id, course_id, scope, scope_id, quiz_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(attemptId, userId, body.courseId, body.scope, body.scopeId, json(storedQuiz), nowIso());
-      addEvent(userId, body.courseId, 'quiz_started', body.scope === 'lesson' ? body.scopeId : undefined, { scope: body.scope });
-    }
+    const storedQuiz = QuizSchema.parse({ ...quiz, id: newId(), scope: body.scope, scopeId: body.scopeId });
+    await remoteInsertQuiz(userId, body.courseId, storedQuiz);
+    await remoteAddEvent(userId, body.courseId, 'quiz_started', body.scope === 'lesson' ? body.scopeId : undefined, { scope: body.scope });
     res.status(201).json({ quiz: QuizPublicSchema.parse(storedQuiz) });
   } catch (error) {
     respondWithServiceError(res, error, 'Quiz generation failed.');
@@ -907,43 +687,9 @@ app.post('/api/quizzes/generate', requireAuth, async (req, res) => {
 app.post('/api/quizzes/:quizId/submit', requireAuth, async (req, res) => {
   const body = parseBody(QuizSubmissionSchema, req, res);
   if (!body) return;
+  const userId = userIdOf(req);
   const quizId = routeParam(req, 'quizId');
-  if (isSupabaseStorage()) {
-    const row = await remoteGetQuiz(userIdOf(req), quizId);
-    if (!row) {
-      res.status(404).json({ error: 'Quiz attempt not found.' });
-      return;
-    }
-    if (row.score !== null || row.completed_at) {
-      res.status(409).json({ error: 'This quiz attempt is already complete. Generate another attempt to retry.' });
-      return;
-    }
-    const quiz = QuizSchema.parse(row.quiz_json);
-    const checkedBody = createQuizSubmissionSchema(quiz).safeParse(body);
-    if (!checkedBody.success) {
-      res.status(400).json({ error: 'Invalid request.', issues: checkedBody.error.issues });
-      return;
-    }
-    const results = quiz.questions.map((question) => ({
-      questionId: question.id,
-      correct: checkedBody.data.answers[question.id] === question.answerIndex,
-      answerIndex: question.answerIndex,
-      explanation: question.explanation,
-    }));
-    const score = Math.round((results.filter((result) => result.correct).length / quiz.questions.length) * 100);
-    const completedAt = nowIso();
-    const completed = await remoteCompleteQuiz(userIdOf(req), quizId, score, completedAt);
-    if (!completed) {
-      res.status(409).json({ error: 'This quiz attempt is already complete. Generate another attempt to retry.' });
-      return;
-    }
-    await remoteAddEvent(userIdOf(req), completed.course_id, 'quiz_completed', completed.scope === 'lesson' ? completed.scope_id : undefined, { scope: completed.scope, score });
-    res.json({ score, results, quiz: QuizPublicSchema.parse(quiz) });
-    return;
-  }
-  const row = db.prepare('SELECT * FROM quiz_attempts WHERE id = ? AND user_id = ?').get(quizId, userIdOf(req)) as {
-    id: string; course_id: string; scope: 'lesson' | 'chapter' | 'course'; scope_id: string; quiz_json: string; score: number | null; completed_at: string | null;
-  } | undefined;
+  const row = await remoteGetQuiz(userId, quizId);
   if (!row) {
     res.status(404).json({ error: 'Quiz attempt not found.' });
     return;
@@ -952,7 +698,7 @@ app.post('/api/quizzes/:quizId/submit', requireAuth, async (req, res) => {
     res.status(409).json({ error: 'This quiz attempt is already complete. Generate another attempt to retry.' });
     return;
   }
-  const quiz = QuizSchema.parse(parseJson(row.quiz_json));
+  const quiz = QuizSchema.parse(row.quiz_json);
   const checkedBody = createQuizSubmissionSchema(quiz).safeParse(body);
   if (!checkedBody.success) {
     res.status(400).json({ error: 'Invalid request.', issues: checkedBody.error.issues });
@@ -965,104 +711,46 @@ app.post('/api/quizzes/:quizId/submit', requireAuth, async (req, res) => {
     explanation: question.explanation,
   }));
   const score = Math.round((results.filter((result) => result.correct).length / quiz.questions.length) * 100);
-  const completedAt = nowIso();
-  const completed = db.transaction(() => {
-    const update = db.prepare(`UPDATE quiz_attempts SET score = ?, completed_at = ?
-      WHERE id = ? AND user_id = ? AND score IS NULL AND completed_at IS NULL`)
-      .run(score, completedAt, row.id, userIdOf(req));
-    if (update.changes !== 1) return false;
-    addEvent(userIdOf(req), row.course_id, 'quiz_completed', row.scope === 'lesson' ? row.scope_id : undefined, { scope: row.scope, score });
-    return true;
-  })();
+  const completed = await remoteCompleteQuiz(userId, quizId, score, nowIso());
   if (!completed) {
     res.status(409).json({ error: 'This quiz attempt is already complete. Generate another attempt to retry.' });
     return;
   }
+  await remoteAddEvent(userId, completed.course_id, 'quiz_completed', completed.scope === 'lesson' ? completed.scope_id : undefined, { scope: completed.scope, score });
   res.json({ score, results, quiz: QuizPublicSchema.parse(quiz) });
 });
 
 app.get('/api/courses/:courseId/activity', requireAuth, async (req, res) => {
+  const userId = userIdOf(req);
   const courseId = routeParam(req, 'courseId');
-  if (isSupabaseStorage()) {
-    if (!await remoteSerializeCourse(userIdOf(req), courseId)) {
-      res.status(404).json({ error: 'Course not found.' });
-      return;
-    }
-    res.json({ events: await remoteActivity(userIdOf(req), courseId) });
-    return;
-  }
-  if (!courseRow(userIdOf(req), courseId)) {
+  if (!await remoteSerializeCourse(userId, courseId)) {
     res.status(404).json({ error: 'Course not found.' });
     return;
   }
-  const events = db.prepare(`SELECT event_type, lesson_id, data_json, created_at FROM progress_events
-    WHERE user_id = ? AND course_id = ? ORDER BY created_at DESC LIMIT 40`).all(userIdOf(req), courseId) as Array<{ event_type: string; lesson_id: string | null; data_json: string | null; created_at: string }>;
-  res.json({ events: events.map((event) => ({ type: event.event_type, lessonId: event.lesson_id, data: event.data_json ? parseJson(event.data_json) : null, at: event.created_at })) });
+  res.json({ events: await remoteActivity(userId, courseId) });
 });
 
 app.get('/api/credits', requireAuth, async (req, res) => {
-  if (isSupabaseStorage()) {
-    res.json({ credits: await remoteGetCreditSummary(userIdOf(req)) });
-    return;
-  }
-  res.json({ credits: getCreditSummary(userIdOf(req)) });
+  res.json({ credits: await remoteGetCreditSummary(userIdOf(req)) });
 });
 
-app.post('/api/credits/topups', requireAuth, async (req, res) => {
+app.post('/api/credits/topups', requireAuth, async (_req, res) => {
   res.status(410).json({ error: 'Midtrans top-ups are temporarily locked. Use a reviewer redeem token.', code: 'midtrans_disabled' });
-  return;
-  /*
-  const body = parseBody(CreateTopUpInputSchema, req, res);
-  if (!body) return;
-  try {
-    const topUp = isSupabaseStorage()
-      ? await remoteCreateCreditTopUp(userIdOf(req), body.productId)
-      : await createCreditTopUp(userIdOf(req), body.productId);
-    res.status(201).json({ topUp });
-  } catch (error) {
-    respondWithServiceError(res, error, 'Could not create the credit top-up.');
-  }
-  */
 });
 
-app.get('/api/credits/topups/:topUpId/status', requireAuth, async (req, res) => {
+app.get('/api/credits/topups/:topUpId/status', requireAuth, async (_req, res) => {
   res.status(410).json({ error: 'Midtrans top-ups are temporarily locked.', code: 'midtrans_disabled' });
-  return;
-  /*
-  try {
-    const status = isSupabaseStorage()
-      ? await remoteSyncCreditTopUp(userIdOf(req), routeParam(req, 'topUpId'))
-      : await syncCreditTopUp(userIdOf(req), routeParam(req, 'topUpId'));
-    const credits = isSupabaseStorage() ? await remoteGetCreditSummary(userIdOf(req)) : getCreditSummary(userIdOf(req));
-    res.json({ ...status, credits });
-  } catch (error) {
-    respondWithServiceError(res, error, 'Could not refresh the credit top-up status.');
-  }
-  */
 });
 
-app.post('/api/midtrans/notification', async (req, res) => {
+app.post('/api/midtrans/notification', async (_req, res) => {
   res.status(410).json({ error: 'Midtrans is temporarily disabled.', code: 'midtrans_disabled' });
-  return;
-  /* try {
-    const result = isSupabaseStorage() ? await remoteHandleMidtransNotification(req.body) : handleMidtransNotification(req.body);
-    res.json({ ok: true, ...result });
-  } catch (error) {
-    const billing = billingStatusCode(error);
-    const remoteBilling = remoteBillingStatusCode(error);
-    if (billing) res.status(billing.status).json(billing.body);
-    else if (remoteBilling) res.status(remoteBilling.status).json(remoteBilling.body);
-    else res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid Midtrans notification.' });
-  } */
 });
 
 app.post('/api/credits/redeem', requireAuth, async (req, res) => {
   const body = parseBody(RedeemCreditInputSchema, req, res);
   if (!body) return;
   try {
-    const redemption = isSupabaseStorage()
-      ? await remoteRedeemCreditToken(userIdOf(req), body.token)
-      : redeemCreditToken(userIdOf(req), body.token);
+    const redemption = await remoteRedeemCreditToken(userIdOf(req), body.token);
     res.json({ redemption });
   } catch (error) {
     respondWithServiceError(res, error, 'Could not redeem this token.');
@@ -1080,10 +768,7 @@ app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not foun
 let vite: ViteDevServer | undefined;
 if (process.env.NODE_ENV !== 'production') {
   vite = await createViteServer({
-    server: {
-      middlewareMode: true,
-      hmr: { host, port: hmrPort },
-    },
+    server: { middlewareMode: true, hmr: { host, port: hmrPort } },
     appType: 'custom',
   });
   app.use(vite.middlewares);
@@ -1112,7 +797,8 @@ app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
     return;
   }
   if (error instanceof CorsOriginError) {
-    res.status(403).json({ error: error.message });
+    console.error('[cors] rejected request origin', error.message);
+    res.status(403).json({ error: 'This origin is not allowed.' });
     return;
   }
   if (error instanceof SyntaxError && (error as SyntaxError & { type?: string }).type === 'entity.parse.failed') {
@@ -1123,8 +809,8 @@ app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
   res.status(500).json({ error: 'Internal server error.' });
 });
 
-cleanExpiredSessions();
 app.listen(port, host, () => {
   console.log(`Synau listening on http://${host}:${port}`);
+  console.log('Storage mode: Supabase');
   console.log(`Generator mode: ${process.env.SYNAU_DEMO_MODE !== 'false' ? 'deterministic demo tools' : 'fixed Sumopod tools'}`);
 });

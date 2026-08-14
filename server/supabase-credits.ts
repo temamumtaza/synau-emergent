@@ -206,6 +206,26 @@ export async function remoteGetCreditSummary(userId: string): Promise<CreditSumm
 
 export type RemoteProviderUsage = { inputTokens: number; cachedInputTokens: number; outputTokens: number; totalTokens: number };
 
+function nonNegativeInteger(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+export function parseUsage(payload: unknown): RemoteProviderUsage | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const usage = (payload as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== 'object') return null;
+  const record = usage as Record<string, unknown>;
+  const promptTokens = nonNegativeInteger(record.prompt_tokens ?? record.input_tokens);
+  const outputTokens = nonNegativeInteger(record.completion_tokens ?? record.output_tokens);
+  const details = record.prompt_tokens_details ?? record.input_tokens_details;
+  const cachedInputTokens = details && typeof details === 'object'
+    ? nonNegativeInteger((details as Record<string, unknown>).cached_tokens ?? (details as Record<string, unknown>).cache_read_input_tokens)
+    : nonNegativeInteger(record.cached_tokens ?? record.cache_read_input_tokens);
+  const totalTokens = nonNegativeInteger(record.total_tokens) || promptTokens + outputTokens;
+  if (promptTokens + outputTokens + totalTokens <= 0) return null;
+  return { inputTokens: promptTokens, cachedInputTokens, outputTokens, totalTokens };
+}
+
 export class RemoteLlmBilling {
   readonly generationId = uuid();
   private readonly usages: RemoteProviderUsage[] = [];
@@ -303,5 +323,9 @@ export async function remoteSyncCreditTopUp(userId: string, topUpId: string) {
 }
 
 export function remoteBillingStatusCode(error: unknown) {
-  return error instanceof RemoteCreditError ? { status: error.status, body: { error: error.message, code: error.code } } : null;
+  if (!(error instanceof RemoteCreditError)) return null;
+  const message = error.code === 'supabase_credit_query_failed'
+    ? 'Credit service is temporarily unavailable.'
+    : error.message;
+  return { status: error.status, body: { error: message, code: error.code } };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { api, CREDITS_CHANGED_EVENT } from '../api';
+import { api } from '../api';
 import type { Course, Roadmap } from '../types';
 import { Icon } from './Icon';
 import { RoadmapPreview } from './RoadmapPreview';
@@ -260,7 +260,6 @@ export function CourseSkeleton() {
 
 export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
   const [courses, setCourses] = useState<Course[]>([]);
-  const [creditBalance, setCreditBalance] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [topic, setTopic] = useState('');
@@ -287,13 +286,6 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
 
   useEffect(() => {
     let active = true;
-    const loadCredits = (force = false) => api.credits(force)
-      .then(({ credits }) => {
-        if (active) setCreditBalance(credits.balance);
-      })
-      .catch(() => {
-        if (active) setCreditBalance(null);
-      });
     api.courses()
       .then(({ courses: loadedCourses }) => {
         if (active) {
@@ -307,12 +299,8 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
       .finally(() => {
         if (active) setLoading(false);
       });
-    void loadCredits();
-    const handleCreditsChanged = () => { void loadCredits(); };
-    window.addEventListener(CREDITS_CHANGED_EVENT, handleCreditsChanged);
     return () => {
       active = false;
-      window.removeEventListener(CREDITS_CHANGED_EVENT, handleCreditsChanged);
     };
   }, []);
 
@@ -413,7 +401,6 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
             <div><strong>{courses.length}</strong><span>Courses</span></div>
             <div><strong>{summary.completed}<small>/{summary.total}</small></strong><span>Lessons complete</span></div>
             <div><strong>{summary.active}</strong><span>Active paths</span></div>
-            <div><strong>{creditBalance === null ? '—' : new Intl.NumberFormat('id-ID').format(creditBalance)}</strong><span>Credits</span></div>
           </div>
       </header>
 
@@ -442,23 +429,8 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
           </div>
         </div>
         <form className="topic-form" onSubmit={(event) => void generate(event)}>
-          <div className="topic-form__controls">
+          <div className="topic-form__field-head">
             <label htmlFor="topic-input">I want to learn</label>
-            <div aria-label="Course language" className="language-toggle" role="group">
-              <span>Language</span>
-              {(['en', 'id'] as const).map((option) => (
-                <button
-                  aria-pressed={language === option}
-                  className={language === option ? 'is-active' : ''}
-                  disabled={generating}
-                  key={option}
-                  onClick={() => setLanguage(option)}
-                  type="button"
-                >
-                  {option.toUpperCase()}
-                </button>
-              ))}
-            </div>
           </div>
           <div className="topic-form__input-row">
             <input
@@ -477,20 +449,48 @@ export function Dashboard({ onOpenCourse, onOpenLibrary }: DashboardProps) {
               value={topic}
             />
             <button className="button button--primary" disabled={generating || topic.trim().length < 3} type="submit">
-              {generating ? <><span className="spinner spinner--light" />Designing path</> : <>Preview roadmap <Icon name="arrow-right" /></>}
+              {generating ? <><span className="spinner spinner--light" />Generating course</> : <>Generate Course <Icon name="arrow-right" /></>}
             </button>
           </div>
-          {formError
-            ? <p className="form-error" id="topic-error" role="alert">{formError}</p>
-            : <p className="field-help" id="topic-help">You will review outcomes, sequence, and time estimates before creating anything.</p>}
+          <div className="topic-form__footer">
+            {formError
+              ? <p className="form-error" id="topic-error" role="alert">{formError}</p>
+              : <p className="field-help" id="topic-help">You will review outcomes, sequence, and time estimates before creating anything.</p>}
+            <div aria-labelledby="course-language-label" className="topic-form__language" role="group">
+              <span id="course-language-label">Course language</span>
+              <div className="language-toggle">
+                {(['en', 'id'] as const).map((option) => (
+                  <button
+                    aria-pressed={language === option}
+                    className={language === option ? 'is-active' : ''}
+                    disabled={generating}
+                    key={option}
+                    onClick={() => setLanguage(option)}
+                    type="button"
+                  >
+                    {option === 'en' ? 'English' : 'Bahasa Indonesia'}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         </form>
-        <div className="topic-suggestions" aria-label="Topic suggestions">
-          <span>Try a topic</span>
-          {topicSuggestions.map((suggestion) => (
-            <button disabled={generating} key={suggestion} onClick={() => useSuggestion(suggestion)} type="button">
-              <Icon name="plus" size={14} />{suggestion}
-            </button>
-          ))}
+        <div aria-labelledby="topic-suggestions-title" className="topic-suggestions">
+          <div className="topic-suggestions__header">
+            <div>
+              <p className="eyebrow" id="topic-suggestions-title">Try a topic</p>
+              <p>Choose a starting point to fill the field.</p>
+            </div>
+          </div>
+          <div className="topic-suggestions__list">
+            {topicSuggestions.map((suggestion) => (
+              <button className="topic-suggestion" disabled={generating} key={suggestion} onClick={() => useSuggestion(suggestion)} type="button">
+                <span className="topic-suggestion__icon"><Icon name="plus" size={14} /></span>
+                <span className="topic-suggestion__label">{suggestion}</span>
+                <Icon name="arrow-right" size={14} />
+              </button>
+            ))}
+          </div>
         </div>
       </section>
 
