@@ -26,7 +26,10 @@ export function getSupabaseBrowserClient() {
 }
 
 export async function signInWithGoogle() {
-  const redirectTo = new URL(import.meta.env.BASE_URL, window.location.origin).toString();
+  const configuredAppUrl = (import.meta.env.VITE_PUBLIC_APP_URL ?? '').trim();
+  const redirectTo = configuredAppUrl
+    ? new URL(configuredAppUrl).toString()
+    : new URL(import.meta.env.BASE_URL, window.location.origin).toString();
   const { error } = await getSupabaseBrowserClient().auth.signInWithOAuth({
     provider: 'google',
     options: {

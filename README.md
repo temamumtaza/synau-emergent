@@ -47,6 +47,7 @@ The frontend no longer stores a Synau bearer token in `localStorage`. Bearer aut
 GitHub Pages can host Synau's static React frontend, but it cannot run the Express API, lesson generators, authentication session boundary, or provider key. The checked-in [`deploy-pages.yml`](/Users/temamumtaza/Documents/synau2026/.github/workflows/deploy-pages.yml) therefore builds only `dist/`. The Supabase browser variables are required; `SYNAU_API_BASE_URL` may remain empty for the initial static bootstrap and must be filled before login or generation can work:
 
 - `SYNAU_API_BASE_URL`: public HTTPS URL of the Express/Supabase backend.
+- `VITE_PUBLIC_APP_URL`: the exact hosted frontend callback URL, currently `https://temamumtaza.github.io/synau-emergent/`.
 - `VITE_SUPABASE_URL`: the Supabase project URL.
 - `VITE_SUPABASE_PUBLISHABLE_KEY`: the Supabase publishable browser key.
 
@@ -64,7 +65,7 @@ The checked-in schema migrations are under [`supabase/migrations`](/Users/temamu
 
 ### Supabase Google authentication
 
-Create a Web OAuth client in Google Cloud. Add the app origins (`http://localhost:8787` and `http://127.0.0.1:8787` during development) as authorized JavaScript origins. Add the exact Supabase callback shown in Authentication → Providers → Google as an authorized redirect URI; for this hosted project it follows `https://<project-ref>.supabase.co/auth/v1/callback`. In Supabase Authentication → URL Configuration, add both local app URLs to the redirect allow list.
+Create a Web OAuth client in Google Cloud. Add the app origins (`http://localhost:8787` and `http://127.0.0.1:8787` during development, plus `https://temamumtaza.github.io` for Pages) as authorized JavaScript origins. Add the exact Supabase callback shown in Authentication → Providers → Google as an authorized redirect URI; for this hosted project it follows `https://<project-ref>.supabase.co/auth/v1/callback`. In Supabase Authentication → URL Configuration, set the hosted Site URL to `https://temamumtaza.github.io/synau-emergent/` and add that exact URL to the redirect allow list. Keep the local URLs as additional development redirects only.
 
 For a repeatable hosted setup, add a Supabase Personal Access Token and the Google OAuth client values to your local `.env`, then run:
 
